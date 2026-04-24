@@ -271,3 +271,9 @@ def test_build_features_for_returns_eth_and_rth_feature_frames():
     assert len(eth) > 1000
     assert len(rth) > 1000
     assert rth["trade_date"].is_monotonic_increasing
+
+    rth_pct = rth["rth_pct_of_eth"].dropna()
+    overnight_pct = rth["overnight_pct_of_eth"].dropna()
+    assert 0 < rth_pct.median() < 1
+    assert not (rth_pct == 1).all()
+    assert not (overnight_pct == 0).all()

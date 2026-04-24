@@ -583,7 +583,17 @@ def _build_features_for(symbol: str, raw: pd.DataFrame,
     eth = compute_eth_rth_cross_features(eth, rth_daily)
 
     rth = _add_common_features(rth_daily, raw, vix, eco, rv_session="rth")
-    rth = compute_eth_rth_cross_features(rth, rth_daily)
+    rth_cross = compute_eth_rth_cross_features(eth_daily, rth)
+    cross_cols = [
+        "trade_date",
+        "rth_inside_flag",
+        "rth_outside_flag",
+        "rth_pct_of_eth",
+        "overnight_pct_of_eth",
+        "overnight_gap_eth",
+        "eth_rth_divergence",
+    ]
+    rth = rth.merge(rth_cross[cross_cols], on="trade_date", how="left")
 
     return eth, rth
 
