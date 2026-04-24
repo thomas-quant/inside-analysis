@@ -190,9 +190,9 @@ def compute_volume_features(df: pd.DataFrame, raw_1min: pd.DataFrame) -> pd.Data
 
 
 def _session_range(raw_1min: pd.DataFrame, session_name: str) -> pd.Series:
-    """Daily H-L range for a named session, indexed by trade_date."""
+    """Daily H-L range for a named session, indexed by Globex trade_date."""
     s = raw_1min[raw_1min["session"] == session_name].copy()
-    s["trade_date"] = s["DateTime_ET"].dt.normalize()
+    s["trade_date"] = _globex_trade_date(s["DateTime_ET"])
     return (
         s.groupby("trade_date")
          .apply(lambda g: g["High"].max() - g["Low"].min())
@@ -218,10 +218,11 @@ def compute_session_features(daily: pd.DataFrame, raw_1min: pd.DataFrame) -> pd.
         sr_aligned = sr.reindex(out["trade_date"]).values
         out[col] = np.clip(sr_aligned / daily_range.values, 0.0, 1.0)
 
-    # Overnight range: bars before 09:30 on calendar date
+    # Overnight range: full Globex overnight before RTH open for each trade_date
     t = raw_1min["DateTime_ET"].dt.time
-    overnight = raw_1min[t < RTH_START].copy()
-    overnight["trade_date"] = overnight["DateTime_ET"].dt.normalize()
+    overnight_mask = (t < RTH_START) | (t >= pd.Timestamp("18:00").time())
+    overnight = raw_1min[overnight_mask].copy()
+    overnight["trade_date"] = _globex_trade_date(overnight["DateTime_ET"])
     ovn_range = (
         overnight.groupby("trade_date")
                  .apply(lambda g: g["High"].max() - g["Low"].min())
@@ -238,7 +239,7 @@ def compute_session_features(daily: pd.DataFrame, raw_1min: pd.DataFrame) -> pd.
     for ses in ["ASIA", "LONDON", "NYAM", "LUNCH", "PM", "OTHER"]:
         mask = raw_1min["session"] == ses
         s = raw_1min[mask].copy()
-        s["trade_date"] = s["DateTime_ET"].dt.normalize()
+        s["trade_date"] = _globex_trade_date(s["DateTime_ET"])
         s = s.sort_values("DateTime_ET")
         s["log_ret"] = np.log(s["Close"] / s["Close"].shift(1))
         s.loc[s["trade_date"] != s["trade_date"].shift(1), "log_ret"] = np.nan
@@ -317,14 +318,23 @@ def compute_eth_rth_cross_features(eth_daily: pd.DataFrame,
     return out.drop(columns=drop_cols, errors="ignore")
 
 
-def compute_calendar_features(daily: pd.DataFrame, eco: pd.DataFrame) -> pd.DataFrame:
+def compute_calendar_features(
+    daily: pd.DataFrame,
+    eco: pd.DataFrame,
+    max_event_date: "pd.Timestamp | None" = None,
+) -> pd.DataFrame:
     """
     Group 5: Calendar & Macro Event features.
     Economic events are in UTC; convert to ET date by subtracting 4 hours.
     Handles timezone-aware datetime_utc by converting to tz-naive after offset.
+    Optionally filters scheduled events after max_event_date to avoid using
+    future calendar revisions beyond the available market-data horizon.
     """
     out = daily.copy()
     out["day_of_week"] = pd.to_datetime(out["trade_date"]).dt.dayofweek  # 0=Mon
+
+    if max_event_date is None and "trade_date" in out.columns and len(out) > 0:
+        max_event_date = pd.to_datetime(out["trade_date"]).max()
 
     eco = eco.copy()
     # Subtract 4h to convert UTC to ET, then normalize to date (tz-naive)
@@ -332,6 +342,10 @@ def compute_calendar_features(daily: pd.DataFrame, eco: pd.DataFrame) -> pd.Data
     if hasattr(et_times.dt, "tz") and et_times.dt.tz is not None:
         et_times = et_times.dt.tz_localize(None)
     eco["et_date"] = et_times.dt.normalize()
+
+    if max_event_date is not None:
+        max_event_date = pd.to_datetime(max_event_date).normalize()
+        eco = eco[eco["et_date"] <= max_event_date].copy()
 
     # Drop non-high-impact events
     eco_high = eco[eco["impact"] == "high"].copy()

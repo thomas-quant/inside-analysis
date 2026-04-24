@@ -131,6 +131,30 @@ def test_session_vol_entropy_nonneg(eth_daily_es, es_1min):
     df = compute_session_features(eth_daily_es, es_1min)
     assert (df["session_vol_entropy"].dropna() >= 0).all()
 
+
+def test_session_features_use_globex_trade_date_for_asia(es_1min, eth_daily_es):
+    from feature_engineering import compute_session_features
+    df = compute_session_features(eth_daily_es, es_1min)
+    row = df[df["trade_date"] == KNOWN_DATE].iloc[0]
+
+    prev_evening_asia = es_1min[
+        (es_1min["session"] == "ASIA")
+        & (es_1min["DateTime_ET"] >= pd.Timestamp("2024-01-02 18:00"))
+        & (es_1min["DateTime_ET"] < pd.Timestamp("2024-01-03 00:00"))
+    ]
+    expected_range = prev_evening_asia["High"].max() - prev_evening_asia["Low"].min()
+    expected_pct = expected_range / float(row["High"] - row["Low"])
+
+    assert abs(row["asia_range_pct"] - expected_pct) < 1e-12
+
+def test_calendar_features_ignore_events_after_market_data_end(rth_daily_es, eco):
+    from feature_engineering import compute_calendar_features
+    df = compute_calendar_features(rth_daily_es, eco)
+    last = df.iloc[-1]
+    assert last["trade_date"] == pd.Timestamp("2025-11-21")
+    assert int(last["high_impact_tomorrow"]) == 0
+    assert int(last["n_events_next_2d"]) == 0
+
 # ── ETH/RTH cross-session features ───────────────────────────────────────────
 def test_eth_rth_cross_features_columns(eth_daily_es, rth_daily_es):
     from feature_engineering import compute_eth_rth_cross_features
@@ -195,7 +219,7 @@ def test_output_parquets_exist():
     import subprocess, os
     result = subprocess.run(
         ["python3", "feature_engineering.py"],
-        capture_output=True, text=True, cwd="/mnt/e/backup/code/Finance/Research/Inside-outside"
+        capture_output=True, text=True, cwd="."
     )
     assert result.returncode == 0, result.stderr
     assert os.path.exists("output/features_es_eth.parquet")
