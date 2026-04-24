@@ -556,19 +556,35 @@ LABEL_COLS  = ["inside", "outside", "neither"]
 ID_COLS     = ["trade_date", "Open", "High", "Low", "Close", "Volume", "range_abs"]
 
 
+def _add_common_features(
+    daily: pd.DataFrame,
+    raw: pd.DataFrame,
+    vix: pd.DataFrame,
+    eco: pd.DataFrame,
+    rv_session: str,
+) -> pd.DataFrame:
+    """Add feature groups that can be computed for either ETH or RTH target bars."""
+    out = compute_rv_features(daily, raw, session=rv_session)
+    out = compute_range_features(out)
+    out = compute_volume_features(out, raw)
+    out = compute_session_features(out, raw)
+    out = compute_calendar_features(out, eco)
+    out = compute_vix_features(out, vix)
+    return out
+
+
 def _build_features_for(symbol: str, raw: pd.DataFrame,
                          vix: pd.DataFrame, eco: pd.DataFrame) -> tuple:
-    """Returns (eth_daily_with_features, rth_daily) tuple."""
-    eth = build_eth_daily(raw)
-    rth = build_rth_daily(raw)
+    """Returns (eth_daily_with_features, rth_daily_with_features) tuple."""
+    eth_daily = build_eth_daily(raw)
+    rth_daily = build_rth_daily(raw)
 
-    eth = compute_rv_features(eth, raw, session="rth")   # RV from RTH bars, on ETH dates
-    eth = compute_range_features(eth)                     # range structure on ETH bars
-    eth = compute_volume_features(eth, raw)
-    eth = compute_session_features(eth, raw)
-    eth = compute_eth_rth_cross_features(eth, rth)        # Group 4b: ETH/RTH relationship
-    eth = compute_calendar_features(eth, eco)
-    eth = compute_vix_features(eth, vix)
+    eth = _add_common_features(eth_daily, raw, vix, eco, rv_session="rth")
+    eth = compute_eth_rth_cross_features(eth, rth_daily)
+
+    rth = _add_common_features(rth_daily, raw, vix, eco, rv_session="rth")
+    rth = compute_eth_rth_cross_features(rth, rth_daily)
+
     return eth, rth
 
 

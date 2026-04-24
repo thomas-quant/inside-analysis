@@ -254,3 +254,20 @@ def test_no_lookahead_in_features():
     df = pd.read_parquet("output/features_es_eth.parquet")
     assert "y" in df.columns
     assert pd.isna(df["y"].iloc[-1])
+
+def test_build_features_for_returns_eth_and_rth_feature_frames():
+    import pandas as pd
+    import feature_engineering as fe
+
+    raw = pd.read_parquet("data/es_1m.parquet")
+    vix = pd.read_parquet("data/vix_cboe.parquet")
+    vix["date"] = pd.to_datetime(vix["date"])
+    eco = pd.read_parquet("data/economic_events.parquet")
+
+    eth, rth = fe._build_features_for("ES", raw, vix, eco)
+
+    assert "range_abs" in eth.columns
+    assert "range_abs" in rth.columns
+    assert len(eth) > 1000
+    assert len(rth) > 1000
+    assert rth["trade_date"].is_monotonic_increasing
