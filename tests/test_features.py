@@ -175,6 +175,31 @@ def test_rth_flags_binary(eth_daily_es, rth_daily_es):
     for col in ["rth_inside_flag", "rth_outside_flag", "eth_rth_divergence"]:
         assert set(df[col].dropna().unique()).issubset({0, 1})
 
+# ── Target builder ────────────────────────────────────────────────────────────
+def test_add_target_uses_session_daily_high_low():
+    import pandas as pd
+    import pytest
+    import numpy as np
+    from feature_engineering import add_target
+
+    df = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+        "Open": [100.0, 101.0, 102.0],
+        "High": [110.0, 108.0, 112.0],
+        "Low": [90.0, 92.0, 88.0],
+        "Close": [105.0, 103.0, 100.0],
+        "Volume": [1, 1, 1],
+        "range_abs": [20.0, 16.0, 24.0],
+    })
+
+    out = add_target(df)
+
+    assert bool(out.loc[1, "inside"]) is True
+    assert bool(out.loc[1, "outside"]) is False
+    assert bool(out.loc[2, "inside"]) is False
+    assert bool(out.loc[2, "outside"]) is True
+    assert out.loc[0, "y"] == pytest.approx(np.log(16.0 / 20.0))
+
 # ── Calendar + VIX features ───────────────────────────────────────────────────
 @pytest.fixture(scope="module")
 def vix():
