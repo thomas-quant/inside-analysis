@@ -156,3 +156,16 @@ def test_compute_probabilities_supports_hist_gradient_boosting():
     assert 0.0 <= p_in <= 1.0
     assert 0.0 <= p_out <= 1.0
     assert 0.0 <= p_nei <= 1.0
+
+
+def test_compute_probabilities_rejects_unknown_classifier_before_label_fallback():
+    import numpy as np
+    import pytest
+    from model import compute_probabilities
+
+    X_train = np.zeros((20, 2))
+    X_test = np.zeros((1, 2))
+    labels = np.zeros(20, dtype=bool)
+
+    with pytest.raises(ValueError, match="Unknown clf_type"):
+        compute_probabilities(X_test, X_train, labels, labels, clf_type="bad")
