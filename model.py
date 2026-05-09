@@ -216,28 +216,42 @@ def walk_forward(
     return pd.DataFrame(records)
 
 
-def main():
+def run_session_models() -> None:
+    """Run HAR/Ridge predictions for ES/NQ across ETH and RTH feature targets."""
     Path("output").mkdir(exist_ok=True)
 
     for symbol in ["es", "nq"]:
-        print(f"\n{'='*50}")
-        print(f"  {symbol.upper()} — loading features")
-        df = pd.read_parquet(f"output/features_{symbol}_eth.parquet")
+        for session in ["eth", "rth"]:
+            print(f"\n{'='*50}")
+            print(f"  {symbol.upper()} {session.upper()} — loading features")
+            df = pd.read_parquet(f"output/features_{symbol}_{session}.parquet")
 
-        print(f"  {symbol.upper()} — HAR baseline (OLS)")
-        har = walk_forward(df, FEATURE_COLS_HAR, TARGET_COL,
-                           init_window=WALK_FORWARD_INIT, model_type="ols",
-                           class_feature_cols=FEATURE_COLS_ALL)
-        har["model"] = "HAR_OLS"
-        har.to_parquet(f"output/predictions_{symbol}_har.parquet", index=False)
-        print(f"  Saved output/predictions_{symbol}_har.parquet  ({len(har)} rows)")
+            print(f"  {symbol.upper()} {session.upper()} — HAR baseline (OLS)")
+            har = walk_forward(df, FEATURE_COLS_HAR, TARGET_COL,
+                               init_window=WALK_FORWARD_INIT, model_type="ols",
+                               class_feature_cols=FEATURE_COLS_ALL)
+            har["model"] = "HAR_OLS"
+            har["session"] = session.upper()
+            har_path = f"output/predictions_{symbol}_{session}_har.parquet"
+            har.to_parquet(har_path, index=False)
+            print(f"  Saved {har_path}  ({len(har)} rows)")
 
-        print(f"  {symbol.upper()} — Full Ridge model")
-        ridge = walk_forward(df, FEATURE_COLS_ALL, TARGET_COL,
-                             init_window=WALK_FORWARD_INIT, model_type="ridge")
-        ridge["model"] = "Full_Ridge"
-        ridge.to_parquet(f"output/predictions_{symbol}_ridge.parquet", index=False)
-        print(f"  Saved output/predictions_{symbol}_ridge.parquet  ({len(ridge)} rows)")
+            print(f"  {symbol.upper()} {session.upper()} — Full Ridge model")
+            ridge = walk_forward(df, FEATURE_COLS_ALL, TARGET_COL,
+                                 init_window=WALK_FORWARD_INIT, model_type="ridge")
+            ridge["model"] = "Full_Ridge"
+            ridge["session"] = session.upper()
+            ridge_path = f"output/predictions_{symbol}_{session}_ridge.parquet"
+            ridge.to_parquet(ridge_path, index=False)
+            print(f"  Saved {ridge_path}  ({len(ridge)} rows)")
+
+            if session == "eth":
+                har.to_parquet(f"output/predictions_{symbol}_har.parquet", index=False)
+                ridge.to_parquet(f"output/predictions_{symbol}_ridge.parquet", index=False)
+
+
+def main():
+    run_session_models()
 
 
 if __name__ == "__main__":
