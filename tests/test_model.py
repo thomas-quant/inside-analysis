@@ -56,3 +56,63 @@ def test_walk_forward_pi_contains_truth_roughly(features_es):
         (results["y_true"] <= results["pi_upper_90"])
     ).mean()
     assert 0.70 < coverage < 0.99, f"PI coverage {coverage:.2f}"
+
+
+def test_run_session_models_writes_session_prediction_outputs(monkeypatch, tmp_path):
+    import pandas as pd
+    import model
+
+    feature_paths = {}
+    for symbol in ["es", "nq"]:
+        for session in ["eth", "rth"]:
+            feature_paths[(symbol, session)] = pd.DataFrame({"trade_date": pd.date_range("2024-01-01", periods=3)})
+
+    def fake_read_parquet(path):
+        stem = path.replace("output/features_", "").replace(".parquet", "")
+        symbol, session = stem.split("_")
+        return feature_paths[(symbol, session)]
+
+    def fake_walk_forward(df, feature_cols, target_col, **kwargs):
+        return pd.DataFrame({
+            "trade_date": [df["trade_date"].iloc[-1]],
+            "y_true": [0.0],
+            "y_hat": [0.1],
+            "pi_lower_90": [-1.0],
+            "pi_upper_90": [1.0],
+            "sigma": [0.2],
+            "p_inside": [0.1],
+            "p_outside": [0.2],
+            "p_neither": [0.7],
+            "true_inside": [False],
+            "true_outside": [False],
+            "true_neither": [True],
+        })
+
+    written = {}
+
+    def fake_to_parquet(self, path, index=False):
+        written[path] = self.copy()
+
+    monkeypatch.setattr(pd, "read_parquet", fake_read_parquet)
+    monkeypatch.setattr(model, "walk_forward", fake_walk_forward)
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", fake_to_parquet)
+
+    model.run_session_models()
+
+    expected = {
+        "output/predictions_es_eth_har.parquet",
+        "output/predictions_es_eth_ridge.parquet",
+        "output/predictions_es_rth_har.parquet",
+        "output/predictions_es_rth_ridge.parquet",
+        "output/predictions_nq_eth_har.parquet",
+        "output/predictions_nq_eth_ridge.parquet",
+        "output/predictions_nq_rth_har.parquet",
+        "output/predictions_nq_rth_ridge.parquet",
+        "output/predictions_es_har.parquet",
+        "output/predictions_es_ridge.parquet",
+        "output/predictions_nq_har.parquet",
+        "output/predictions_nq_ridge.parquet",
+    }
+    assert set(written) == expected
+    assert written["output/predictions_es_rth_har.parquet"]["session"].iloc[0] == "RTH"
+    assert written["output/predictions_es_rth_har.parquet"]["model"].iloc[0] == "HAR_OLS"
