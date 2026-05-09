@@ -277,3 +277,39 @@ def test_build_features_for_returns_eth_and_rth_feature_frames():
     assert 0 < rth_pct.median() < 1
     assert not (rth_pct == 1).all()
     assert not (overnight_pct == 0).all()
+
+
+def test_finalize_feature_frames_returns_eth_and_rth_outputs():
+    import pandas as pd
+    from feature_engineering import finalize_feature_frames
+
+    def frame(offset):
+        return pd.DataFrame({
+            "trade_date": pd.date_range("2024-01-02", periods=4, freq="D"),
+            "Open": [100 + offset, 101 + offset, 102 + offset, 103 + offset],
+            "High": [110 + offset, 108 + offset, 112 + offset, 111 + offset],
+            "Low": [90 + offset, 92 + offset, 88 + offset, 91 + offset],
+            "Close": [105 + offset, 103 + offset, 100 + offset, 109 + offset],
+            "Volume": [1, 1, 1, 1],
+            "range_abs": [20.0, 16.0, 24.0, 20.0],
+            "close_location": [0.75, 0.6875, 0.5, 0.9],
+            "rv_1d": [0.1, 0.2, 0.3, 0.4],
+        })
+
+    outputs = finalize_feature_frames(
+        es=frame(0),
+        nq=frame(100),
+        es_rth=frame(1),
+        nq_rth=frame(101),
+    )
+
+    assert set(outputs) == {
+        "output/features_es_eth.parquet",
+        "output/features_nq_eth.parquet",
+        "output/features_es_rth.parquet",
+        "output/features_nq_rth.parquet",
+    }
+    for result in outputs.values():
+        assert {"inside", "outside", "neither", "y", "range_percentile_22"}.issubset(result.columns)
+        assert "es_nq_rv_ratio" in result.columns
+        assert pd.isna(result["y"].iloc[-1])
