@@ -598,6 +598,29 @@ def _build_features_for(symbol: str, raw: pd.DataFrame,
     return eth, rth
 
 
+def finalize_feature_frames(
+    es: pd.DataFrame,
+    nq: pd.DataFrame,
+    es_rth: pd.DataFrame,
+    nq_rth: pd.DataFrame,
+) -> dict[str, pd.DataFrame]:
+    """Add cross-instrument features, targets, and pattern features for ETH/RTH outputs."""
+    es, nq = compute_cross_instrument_features(es, nq)
+    es_rth, nq_rth = compute_cross_instrument_features(es_rth, nq_rth)
+
+    outputs = {
+        "output/features_es_eth.parquet": es,
+        "output/features_nq_eth.parquet": nq,
+        "output/features_es_rth.parquet": es_rth,
+        "output/features_nq_rth.parquet": nq_rth,
+    }
+
+    finalized = {}
+    for path, frame in outputs.items():
+        finalized[path] = compute_pattern_features(add_target(frame))
+    return finalized
+
+
 def main():
     Path("output").mkdir(exist_ok=True)
 
@@ -615,23 +638,21 @@ def main():
     print("Engineering NQ features...")
     nq, nq_rth = _build_features_for("NQ", nq_raw, vix, eco)
 
-    print("Adding cross-instrument features...")
-    es, nq = compute_cross_instrument_features(es, nq)
+    print("Finalizing ETH/RTH feature outputs...")
+    outputs = finalize_feature_frames(es, nq, es_rth, nq_rth)
 
-    print("Adding targets...")
-    es = add_target(es)
-    nq = add_target(nq)
+    for path, frame in outputs.items():
+        frame.to_parquet(path, index=False)
+        print(f"Saved {path}")
 
-    print("Adding pattern features...")
-    es = compute_pattern_features(es)
-    nq = compute_pattern_features(nq)
-
-    es.to_parquet("output/features_es_eth.parquet", index=False)
-    nq.to_parquet("output/features_nq_eth.parquet", index=False)
-    print("Saved output/features_es_eth.parquet")
-    print("Saved output/features_nq_eth.parquet")
-    print(f"ES: {len(es)} days, {es[FEATURE_COLS_ALL].notna().all(axis=1).sum()} fully complete rows")
-    print(f"NQ: {len(nq)} days, {nq[FEATURE_COLS_ALL].notna().all(axis=1).sum()} fully complete rows")
+    for label, frame in [
+        ("ES ETH", outputs["output/features_es_eth.parquet"]),
+        ("NQ ETH", outputs["output/features_nq_eth.parquet"]),
+        ("ES RTH", outputs["output/features_es_rth.parquet"]),
+        ("NQ RTH", outputs["output/features_nq_rth.parquet"]),
+    ]:
+        complete = frame[FEATURE_COLS_ALL].notna().all(axis=1).sum()
+        print(f"{label}: {len(frame)} days, {complete} fully complete rows")
 
 
 if __name__ == "__main__":
