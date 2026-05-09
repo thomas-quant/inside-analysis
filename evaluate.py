@@ -148,66 +148,77 @@ def plot_feature_importance(importance: pd.DataFrame, symbol: str):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
+def run_session_evaluation() -> pd.DataFrame:
+    """Evaluate HAR/Ridge predictions for ES/NQ across ETH and RTH targets."""
     all_metrics = []
 
     for symbol in ["es", "nq"]:
-        print(f"\n{'='*55}")
-        print(f"  {symbol.upper()}")
+        for session in ["eth", "rth"]:
+            print(f"\n{'='*55}")
+            print(f"  {symbol.upper()} {session.upper()}")
 
-        har   = pd.read_parquet(f"output/predictions_{symbol}_har.parquet")
-        ridge = pd.read_parquet(f"output/predictions_{symbol}_ridge.parquet")
-        har["trade_date"]   = pd.to_datetime(har["trade_date"])
-        ridge["trade_date"] = pd.to_datetime(ridge["trade_date"])
+            har = pd.read_parquet(f"output/predictions_{symbol}_{session}_har.parquet")
+            ridge = pd.read_parquet(f"output/predictions_{symbol}_{session}_ridge.parquet")
+            har["trade_date"] = pd.to_datetime(har["trade_date"])
+            ridge["trade_date"] = pd.to_datetime(ridge["trade_date"])
 
-        # Load feature file for importance computation (ETH parquet)
-        features = pd.read_parquet(f"output/features_{symbol}_eth.parquet")
+            features = pd.read_parquet(f"output/features_{symbol}_{session}.parquet")
 
-        for preds, model_name in [(har, "HAR_OLS"), (ridge, "Full_Ridge")]:
-            r2    = oos_r2(preds["y_true"], preds["y_hat"])
-            rmse_ = rmse(preds["y_true"],  preds["y_hat"])
-            cov   = pi_coverage(preds["y_true"], preds["pi_lower_90"], preds["pi_upper_90"])
-            bs_in  = brier_score(preds["p_inside"],  preds["true_inside"])
-            bs_out = brier_score(preds["p_outside"], preds["true_outside"])
+            for preds, model_name in [(har, "HAR_OLS"), (ridge, "Full_Ridge")]:
+                r2 = oos_r2(preds["y_true"], preds["y_hat"])
+                rmse_ = rmse(preds["y_true"], preds["y_hat"])
+                cov = pi_coverage(preds["y_true"], preds["pi_lower_90"], preds["pi_upper_90"])
+                bs_in = brier_score(preds["p_inside"], preds["true_inside"])
+                bs_out = brier_score(preds["p_outside"], preds["true_outside"])
 
-            print(f"\n  {model_name}")
-            print(f"    OOS R²          : {r2:.4f}")
-            print(f"    RMSE            : {rmse_:.4f}")
-            print(f"    90% PI coverage : {cov:.3f}  (target: 0.900)")
-            print(f"    Brier(inside)   : {bs_in:.4f}  (naive: {preds['true_inside'].mean()*(1-preds['true_inside'].mean()):.4f})")
-            print(f"    Brier(outside)  : {bs_out:.4f}  (naive: {preds['true_outside'].mean()*(1-preds['true_outside'].mean()):.4f})")
+                print(f"\n  {model_name}")
+                print(f"    OOS R²          : {r2:.4f}")
+                print(f"    RMSE            : {rmse_:.4f}")
+                print(f"    90% PI coverage : {cov:.3f}  (target: 0.900)")
+                print(f"    Brier(inside)   : {bs_in:.4f}  (naive: {preds['true_inside'].mean()*(1-preds['true_inside'].mean()):.4f})")
+                print(f"    Brier(outside)  : {bs_out:.4f}  (naive: {preds['true_outside'].mean()*(1-preds['true_outside'].mean()):.4f})")
 
-            all_metrics.append({
-                "symbol": symbol.upper(), "model": model_name,
-                "oos_r2": r2, "rmse": rmse_, "pi_coverage_90": cov,
-                "brier_inside": bs_in, "brier_outside": bs_out,
-                "n_test_days": len(preds),
-            })
+                all_metrics.append({
+                    "symbol": symbol.upper(),
+                    "session": session.upper(),
+                    "model": model_name,
+                    "oos_r2": r2,
+                    "rmse": rmse_,
+                    "pi_coverage_90": cov,
+                    "brier_inside": bs_in,
+                    "brier_outside": bs_out,
+                    "n_test_days": len(preds),
+                })
 
-            plot_actual_vs_predicted(preds, symbol.upper(), model_name)
-            plot_probability_calibration(preds, symbol.upper(), model_name)
+                plot_label = f"{symbol.upper()}_{session.upper()}"
+                plot_actual_vs_predicted(preds, plot_label, model_name)
+                plot_probability_calibration(preds, plot_label, model_name)
 
-        # Diebold-Mariano test: does Ridge beat HAR?
-        merged = har.merge(ridge[["trade_date", "y_hat"]], on="trade_date",
-                           suffixes=("_har", "_ridge"))
-        e_har   = (merged["y_true"] - merged["y_hat_har"])   ** 2
-        e_ridge = (merged["y_true"] - merged["y_hat_ridge"]) ** 2
-        dm_stat, dm_pval = diebold_mariano(e_har.values, e_ridge.values)
-        print(f"\n  Diebold-Mariano (HAR vs Ridge): stat={dm_stat:.3f}, p={dm_pval:.4f}")
-        print(f"  {'Ridge significantly better' if dm_pval < 0.05 and dm_stat > 0 else 'No significant difference'}")
+            merged = har.merge(ridge[["trade_date", "y_hat"]], on="trade_date",
+                               suffixes=("_har", "_ridge"))
+            e_har = (merged["y_true"] - merged["y_hat_har"]) ** 2
+            e_ridge = (merged["y_true"] - merged["y_hat_ridge"]) ** 2
+            dm_stat, dm_pval = diebold_mariano(e_har.values, e_ridge.values)
+            print(f"\n  Diebold-Mariano (HAR vs Ridge): stat={dm_stat:.3f}, p={dm_pval:.4f}")
+            print(f"  {'Ridge significantly better' if dm_pval < 0.05 and dm_stat > 0 else 'No significant difference'}")
 
-        # Feature importance
-        imp = compute_feature_importance(features, symbol.upper())
-        imp.to_csv(f"output/feature_importance_{symbol}.csv", index=False)
-        plot_feature_importance(imp, symbol.upper())
+            imp_label = f"{symbol.upper()}_{session.upper()}"
+            imp = compute_feature_importance(features, imp_label)
+            imp.to_csv(f"output/feature_importance_{symbol}_{session}.csv", index=False)
+            plot_feature_importance(imp, imp_label)
 
-        print(f"\n  Top 10 features ({symbol.upper()}):")
-        print(imp[["feature", "coef", "abs_coef"]].head(10).to_string(index=False))
+            print(f"\n  Top 10 features ({imp_label}):")
+            print(imp[["feature", "coef", "abs_coef"]].head(10).to_string(index=False))
 
     metrics_df = pd.DataFrame(all_metrics)
     metrics_df.to_csv("output/metrics_summary.csv", index=False)
     print(f"\n\nSaved output/metrics_summary.csv")
     print(metrics_df.to_string(index=False))
+    return metrics_df
+
+
+def main():
+    run_session_evaluation()
 
 
 if __name__ == "__main__":
