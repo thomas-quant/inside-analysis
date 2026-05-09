@@ -137,3 +137,22 @@ def test_compute_probabilities_accepts_balanced_class_weight():
     assert 0.0 <= p_in <= 1.0
     assert 0.0 <= p_out <= 1.0
     assert 0.0 <= p_nei <= 1.0
+
+
+def test_compute_probabilities_supports_hist_gradient_boosting():
+    import numpy as np
+    from model import compute_probabilities
+
+    rng = np.random.default_rng(11)
+    X_train = rng.normal(size=(120, 5))
+    X_test = rng.normal(size=(1, 5))
+    inside = X_train[:, 0] > 1.0
+    outside = X_train[:, 1] < -1.0
+
+    p_in, p_out, p_nei = compute_probabilities(
+        X_test, X_train, inside, outside, clf_type="hgb"
+    )
+
+    assert 0.0 <= p_in <= 1.0
+    assert 0.0 <= p_out <= 1.0
+    assert 0.0 <= p_nei <= 1.0

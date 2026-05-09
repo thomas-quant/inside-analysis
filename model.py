@@ -95,6 +95,7 @@ def compute_probabilities(
     labels_outside_next: np.ndarray,
     scaler: "StandardScaler | None" = None,
     class_weight: "str | dict | None" = None,
+    clf_type: str = "logistic",
 ) -> tuple:
     """
     Calibrated classification probabilities via logistic regression on the full
@@ -117,15 +118,23 @@ def compute_probabilities(
         Xs_tr = sc.transform(X_train)
         Xs_te = sc.transform(X_test)
 
-    def _logistic_prob(labels):
+    def _clf_prob(labels):
         if labels.sum() < 5:
             return float(labels.mean())
-        lr = LogisticRegression(C=0.1, max_iter=300, solver="lbfgs", class_weight=class_weight)
-        lr.fit(Xs_tr, labels.astype(int))
-        return float(lr.predict_proba(Xs_te)[0, 1])
+        if clf_type == "logistic":
+            clf = LogisticRegression(C=0.1, max_iter=300, solver="lbfgs", class_weight=class_weight)
+        elif clf_type == "hgb":
+            from sklearn.ensemble import HistGradientBoostingClassifier
+            clf = HistGradientBoostingClassifier(
+                max_iter=100, learning_rate=0.05, max_leaf_nodes=15, random_state=42
+            )
+        else:
+            raise ValueError(f"Unknown clf_type={clf_type}")
+        clf.fit(Xs_tr, labels.astype(int))
+        return float(clf.predict_proba(Xs_te)[0, 1])
 
-    p_in  = _logistic_prob(labels_inside_next)
-    p_out = _logistic_prob(labels_outside_next)
+    p_in  = _clf_prob(labels_inside_next)
+    p_out = _clf_prob(labels_outside_next)
     p_nei = max(0.0, 1.0 - p_in - p_out)
     return p_in, p_out, p_nei
 
