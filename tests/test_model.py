@@ -116,3 +116,24 @@ def test_run_session_models_writes_session_prediction_outputs(monkeypatch, tmp_p
     assert set(written) == expected
     assert written["output/predictions_es_rth_har.parquet"]["session"].iloc[0] == "RTH"
     assert written["output/predictions_es_rth_har.parquet"]["model"].iloc[0] == "HAR_OLS"
+
+
+def test_compute_probabilities_accepts_balanced_class_weight():
+    import numpy as np
+    from model import compute_probabilities
+
+    rng = np.random.default_rng(7)
+    X_train = rng.normal(size=(80, 4))
+    X_test = rng.normal(size=(1, 4))
+    inside = np.zeros(80, dtype=bool)
+    inside[:8] = True
+    outside = np.zeros(80, dtype=bool)
+    outside[8:18] = True
+
+    p_in, p_out, p_nei = compute_probabilities(
+        X_test, X_train, inside, outside, class_weight="balanced"
+    )
+
+    assert 0.0 <= p_in <= 1.0
+    assert 0.0 <= p_out <= 1.0
+    assert 0.0 <= p_nei <= 1.0

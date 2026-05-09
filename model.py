@@ -94,6 +94,7 @@ def compute_probabilities(
     labels_inside_next: np.ndarray,
     labels_outside_next: np.ndarray,
     scaler: "StandardScaler | None" = None,
+    class_weight: "str | dict | None" = None,
 ) -> tuple:
     """
     Calibrated classification probabilities via logistic regression on the full
@@ -119,7 +120,7 @@ def compute_probabilities(
     def _logistic_prob(labels):
         if labels.sum() < 5:
             return float(labels.mean())
-        lr = LogisticRegression(C=0.1, max_iter=300, solver="lbfgs")
+        lr = LogisticRegression(C=0.1, max_iter=300, solver="lbfgs", class_weight=class_weight)
         lr.fit(Xs_tr, labels.astype(int))
         return float(lr.predict_proba(Xs_te)[0, 1])
 
@@ -192,7 +193,8 @@ def walk_forward(
             )
 
         p_in, p_out, p_nei = compute_probabilities(
-            X_test_clf, X_train_clf, is_inside_next, is_outside_next
+            X_test_clf, X_train_clf, is_inside_next, is_outside_next,
+            class_weight="balanced",
         )
 
         records.append({
