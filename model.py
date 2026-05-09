@@ -110,6 +110,9 @@ def compute_probabilities(
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler as SS
 
+    if clf_type not in {"logistic", "hgb"}:
+        raise ValueError(f"Unknown clf_type={clf_type}")
+
     if scaler is not None:
         Xs_tr = scaler.transform(X_train)
         Xs_te = scaler.transform(X_test)
@@ -128,8 +131,6 @@ def compute_probabilities(
             clf = HistGradientBoostingClassifier(
                 max_iter=100, learning_rate=0.05, max_leaf_nodes=15, random_state=42
             )
-        else:
-            raise ValueError(f"Unknown clf_type={clf_type}")
         clf.fit(Xs_tr, labels.astype(int))
         return float(clf.predict_proba(Xs_te)[0, 1])
 
