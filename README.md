@@ -7,7 +7,7 @@ Walk-forward volatility forecasting for ES and NQ futures. Predicts next-day log
 An "inside day" occurs when the day's high-low range is contained within the prior day's range. These days represent volatility compression and are relatively rare (~10–12% base rate). This project builds a machine learning pipeline to predict them using a broad set of market microstructure features.
 
 **Primary target:** `y = log(range_{t+1} / range_t)` — next-day log range ratio
-**Primary session:** ETH (full Globex session, trade date rolls at 18:00 ET)
+**Sessions:** ETH/Globex and RTH are modeled as separate targets. ETH remains the original baseline; RTH has its own inside/outside labels and range-ratio target.
 
 ## Results (OOS, ~792 test days)
 
@@ -22,10 +22,10 @@ An "inside day" occurs when the day's high-low range is contained within the pri
 data/{es,nq}_1m.parquet + vix_cboe.parquet + economic_events.parquet
          │
          ▼
-feature_engineering.py     → output/features_{es,nq}_eth.parquet
+feature_engineering.py     → output/features_{es,nq}_{eth,rth}.parquet
          │
          ▼
-model.py (walk-forward)    → output/predictions_{es,nq}_{har,ridge}.parquet
+model.py (walk-forward)    → output/predictions_{es,nq}_{eth,rth}_{har,ridge}.parquet
          │
          ▼
 evaluate.py                → output/metrics_summary.csv + output/plots/
@@ -47,13 +47,19 @@ Baseline stats (not part of the main pipeline):
 python3 baseline_stats.py
 ```
 
-Run tests:
+Run safe tests (default skips parquet/pipeline-heavy tests):
 
 ```bash
 python3 -m pytest tests/ -v
 ```
 
-> Tests require `data/` parquets (`test_features.py`) and `output/` parquets (`test_model.py`).
+Run data-heavy regression tests only when local memory budget allows:
+
+```bash
+RUN_DATA_HEAVY=1 python3 -m pytest tests/ -m data_heavy -v
+```
+
+> Data-heavy tests require `data/` parquets and generated `output/` parquets.
 
 ## Models
 
@@ -61,7 +67,7 @@ python3 -m pytest tests/ -v
 
 **Ridge** — Regularised regression on the full 40+ feature set. Expanding walk-forward window with initial training period of 252 trading days.
 
-Both models share the same **logistic regression classifier** trained on `FEATURE_COLS_ALL` for inside/outside/neither probabilities.
+Both models share the same **class-balanced logistic regression classifier** trained on `FEATURE_COLS_ALL` for inside/outside/neither probabilities. `HistGradientBoostingClassifier` is available as an experimental classifier option.
 
 ## Features (40+)
 
@@ -75,7 +81,7 @@ Both models share the same **logistic regression classifier** trained on `FEATUR
 | Calendar | day_of_week, fomc, nfp, high_impact_* |
 | VIX | vix_close, vix_change_1d, vix_rv_spread, vix_percentile_252 |
 | Cross-instrument | es_nq_rv_ratio, es_nq_range_ratio |
-| Pattern | hl_containment, range_vs_max_{3,5,10}d, contraction_streak, inside_lag1, range_percentile_22 |
+| Pattern | hl_containment, range_vs_max_{3,5,10}d, contraction_streak, inside_lag1, range_percentile_22, nr4/nr7, wr4/wr7, inside/outside streaks |
 
 ## Data
 
