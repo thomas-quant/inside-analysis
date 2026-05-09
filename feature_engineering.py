@@ -499,6 +499,23 @@ def compute_pattern_features(daily: pd.DataFrame) -> pd.DataFrame:
          .apply(lambda x: (x[:-1] < x[-1]).mean(), raw=True)
     )
 
+    for n in [4, 7]:
+        rolling_min = r.rolling(n, min_periods=n).min()
+        rolling_max = r.rolling(n, min_periods=n).max()
+        out[f"nr{n}_flag"] = (r == rolling_min).astype(int)
+        out[f"wr{n}_flag"] = (r == rolling_max).astype(int)
+
+    def _streak(values: pd.Series) -> pd.Series:
+        counts = []
+        current = 0
+        for value in values.fillna(False).astype(bool):
+            current = current + 1 if value else 0
+            counts.append(current)
+        return pd.Series(counts, index=values.index, dtype=float)
+
+    out["inside_streak"] = _streak(out["inside"])
+    out["outside_streak"] = _streak(out["outside"])
+
     return out
 
 
@@ -549,6 +566,8 @@ FEATURE_COLS_ALL = [
     "range_vs_max_3d", "range_vs_max_5d", "range_vs_max_10d",
     "contraction_streak", "close_vs_midpoint",
     "inside_lag1", "outside_lag1", "range_percentile_22",
+    "nr4_flag", "nr7_flag", "wr4_flag", "wr7_flag",
+    "inside_streak", "outside_streak",
 ]
 
 TARGET_COL  = "y"

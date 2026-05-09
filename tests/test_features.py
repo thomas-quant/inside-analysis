@@ -313,3 +313,26 @@ def test_finalize_feature_frames_returns_eth_and_rth_outputs():
         assert {"inside", "outside", "neither", "y", "range_percentile_22"}.issubset(result.columns)
         assert "es_nq_rv_ratio" in result.columns
         assert pd.isna(result["y"].iloc[-1])
+
+
+def test_pattern_features_include_nr_wr_and_streaks():
+    import pandas as pd
+    from feature_engineering import compute_range_features, add_target, compute_pattern_features
+
+    df = pd.DataFrame({
+        "trade_date": pd.date_range("2024-01-01", periods=8, freq="D"),
+        "Open": [10, 10, 10, 10, 10, 10, 10, 10],
+        "High": [20, 19, 18, 17, 16, 30, 29, 28],
+        "Low": [10, 11, 12, 13, 14, 5, 6, 7],
+        "Close": [15, 15, 15, 15, 15, 20, 20, 20],
+        "Volume": [1]*8,
+    })
+    df = compute_range_features(df)
+    df = add_target(df)
+    out = compute_pattern_features(df)
+
+    for col in ["nr4_flag", "nr7_flag", "wr4_flag", "wr7_flag", "inside_streak", "outside_streak"]:
+        assert col in out.columns
+
+    assert out.loc[4, "nr4_flag"] == 1
+    assert out.loc[5, "wr4_flag"] == 1
