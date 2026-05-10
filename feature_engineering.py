@@ -441,13 +441,62 @@ def compute_cross_instrument_features(
     - es_nq_rv_ratio    : rv_1d_ES / rv_1d_NQ
     - es_nq_range_ratio : range_ES / range_NQ
     """
+    def _break_state(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+        out = df[["trade_date", "High", "Low"]].copy()
+        prev_h = out["High"].shift(1)
+        prev_l = out["Low"].shift(1)
+        valid = prev_h.notna() & prev_l.notna()
+        break_high = (out["High"] > prev_h) & valid
+        break_low = (out["Low"] < prev_l) & valid
+        out[f"{prefix}_break_high"] = break_high.astype(float).where(valid)
+        out[f"{prefix}_break_low"] = break_low.astype(float).where(valid)
+        out[f"{prefix}_outside"] = (break_high & break_low).astype(float).where(valid)
+        out[f"{prefix}_one_side"] = (break_high ^ break_low).astype(float).where(valid)
+        out[f"{prefix}_high_only"] = (break_high & ~break_low).astype(float).where(valid)
+        out[f"{prefix}_low_only"] = (~break_high & break_low).astype(float).where(valid)
+        return out.drop(columns=["High", "Low"])
+
     cross = daily_es[["trade_date", "rv_1d", "range_abs"]].merge(
         daily_nq[["trade_date", "rv_1d", "range_abs"]],
         on="trade_date", suffixes=("_es", "_nq")
     )
+    cross = cross.merge(_break_state(daily_es, "es"), on="trade_date", how="left")
+    cross = cross.merge(_break_state(daily_nq, "nq"), on="trade_date", how="left")
+
     cross["es_nq_rv_ratio"]    = cross["rv_1d_es"]    / cross["rv_1d_nq"]
     cross["es_nq_range_ratio"] = cross["range_abs_es"] / cross["range_abs_nq"]
-    cross_cols = cross[["trade_date", "es_nq_rv_ratio", "es_nq_range_ratio"]]
+
+    cross["both_outside"] = ((cross["es_outside"] == 1) & (cross["nq_outside"] == 1)).astype(float)
+    cross["both_one_side"] = ((cross["es_one_side"] == 1) & (cross["nq_one_side"] == 1)).astype(float)
+    cross["es_nq_outside_divergence"] = (cross["es_outside"] != cross["nq_outside"]).astype(float)
+    cross.loc[cross[["es_outside", "nq_outside"]].isna().any(axis=1), "es_nq_outside_divergence"] = np.nan
+    cross["nq_outside_es_one_side"] = ((cross["nq_outside"] == 1) & (cross["es_one_side"] == 1)).astype(float)
+    cross["es_outside_nq_one_side"] = ((cross["es_outside"] == 1) & (cross["nq_one_side"] == 1)).astype(float)
+    cross["break_direction_agreement"] = (
+        (cross["es_break_high"] == cross["nq_break_high"]) &
+        (cross["es_break_low"] == cross["nq_break_low"])
+    ).astype(float)
+    cross.loc[cross[["es_break_high", "nq_break_high", "es_break_low", "nq_break_low"]].isna().any(axis=1),
+              "break_direction_agreement"] = np.nan
+
+    for col in ["es_nq_outside_divergence", "nq_outside_es_one_side", "es_outside_nq_one_side"]:
+        cross[f"{col}_rate_5"] = cross[col].rolling(5, min_periods=1).mean()
+        cross[f"{col}_rate_22"] = cross[col].rolling(22, min_periods=5).mean()
+
+    cross = cross.rename(columns={
+        "es_nq_outside_divergence_rate_5": "cross_outside_divergence_rate_5",
+        "es_nq_outside_divergence_rate_22": "cross_outside_divergence_rate_22",
+    })
+
+    cross_cols = cross[[
+        "trade_date", "es_nq_rv_ratio", "es_nq_range_ratio",
+        "both_outside", "both_one_side", "es_nq_outside_divergence",
+        "nq_outside_es_one_side", "es_outside_nq_one_side",
+        "break_direction_agreement", "cross_outside_divergence_rate_5",
+        "cross_outside_divergence_rate_22", "nq_outside_es_one_side_rate_5",
+        "nq_outside_es_one_side_rate_22", "es_outside_nq_one_side_rate_5",
+        "es_outside_nq_one_side_rate_22",
+    ]]
 
     es_out = daily_es.merge(cross_cols, on="trade_date", how="left")
     nq_out = daily_nq.merge(cross_cols, on="trade_date", how="left")
@@ -481,6 +530,17 @@ def compute_pattern_features(daily: pd.DataFrame) -> pd.DataFrame:
     out["h_proximity"]    = (pH - out["High"]) / pr
     out["l_proximity"]    = (out["Low"] - pL)  / pr
     out["hl_containment"] = out["h_proximity"] + out["l_proximity"]
+
+    out["break_high"] = (out["High"] > pH)
+    out["break_low"] = (out["Low"] < pL)
+    out["high_only_break"] = out["break_high"] & ~out["break_low"]
+    out["low_only_break"] = ~out["break_high"] & out["break_low"]
+    out["one_side_break"] = out["break_high"] ^ out["break_low"]
+    out["dist_to_prev_high"] = ((pH - out["High"]).clip(lower=0)) / pr
+    out["dist_to_prev_low"] = ((out["Low"] - pL).clip(lower=0)) / pr
+    overnight_gap = out["overnight_gap"] if "overnight_gap" in out.columns else (out["Open"] - out["Close"].shift(1)) / pr
+    out["gap_direction"] = np.sign(overnight_gap).fillna(0.0)
+    out["abs_overnight_gap"] = overnight_gap.abs()
 
     for n in [3, 5, 10]:
         roll_max = r.rolling(n, min_periods=n).max().shift(1)
@@ -561,8 +621,17 @@ FEATURE_COLS_ALL = [
     "vix_close", "vix_change_1d", "vix_rv_spread", "vix_percentile_252",
     # Group 7 — Cross-instrument (ES ↔ NQ)
     "es_nq_rv_ratio", "es_nq_range_ratio",
+    "both_outside", "both_one_side", "es_nq_outside_divergence",
+    "nq_outside_es_one_side", "es_outside_nq_one_side",
+    "break_direction_agreement", "cross_outside_divergence_rate_5",
+    "cross_outside_divergence_rate_22", "nq_outside_es_one_side_rate_5",
+    "nq_outside_es_one_side_rate_22", "es_outside_nq_one_side_rate_5",
+    "es_outside_nq_one_side_rate_22",
     # Group 8 — Inside/Outside Pattern (lagged structure + HL proximity + compression)
     "h_proximity", "l_proximity", "hl_containment",
+    "break_high", "break_low", "high_only_break", "low_only_break",
+    "one_side_break", "dist_to_prev_high", "dist_to_prev_low",
+    "gap_direction", "abs_overnight_gap",
     "range_vs_max_3d", "range_vs_max_5d", "range_vs_max_10d",
     "contraction_streak", "close_vs_midpoint",
     "inside_lag1", "outside_lag1", "range_percentile_22",

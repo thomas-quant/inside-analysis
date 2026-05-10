@@ -169,3 +169,56 @@ def test_compute_probabilities_rejects_unknown_classifier_before_label_fallback(
 
     with pytest.raises(ValueError, match="Unknown clf_type"):
         compute_probabilities(X_test, X_train, labels, labels, clf_type="bad")
+
+
+def test_rolling_platt_calibration_uses_only_prior_rows():
+    from model import rolling_platt_calibrate
+
+    scores = np.array([0.2, 0.8, 0.7, 0.9, 0.1, 0.95, 0.85])
+    labels_a = np.array([0, 1, 1, 1, 0, 1, 0])
+    labels_b = np.array([0, 1, 1, 1, 0, 1, 1])
+
+    cal_a = rolling_platt_calibrate(scores, labels_a, min_samples=4, min_pos=1, min_neg=1)
+    cal_b = rolling_platt_calibrate(scores, labels_b, min_samples=4, min_pos=1, min_neg=1)
+
+    assert np.all((0.0 <= cal_a) & (cal_a <= 1.0))
+    assert cal_a[-1] == cal_b[-1], "current row label must not calibrate its own probability"
+
+
+def test_normalize_event_probabilities_clips_and_rescales():
+    from model import normalize_event_probabilities
+
+    p_inside, p_outside, p_neither = normalize_event_probabilities([0.8, -1.0], [0.7, 0.4])
+
+    assert np.allclose(p_inside + p_outside + p_neither, 1.0)
+    assert np.all((0.0 <= p_inside) & (p_inside <= 1.0))
+    assert np.all((0.0 <= p_outside) & (p_outside <= 1.0))
+    assert np.all((0.0 <= p_neither) & (p_neither <= 1.0))
+
+
+def test_walk_forward_emits_raw_scores_and_calibrated_probabilities():
+    from model import walk_forward
+
+    n = 40
+    rng = np.random.default_rng(123)
+    df = pd.DataFrame({
+        "trade_date": pd.date_range("2024-01-01", periods=n, freq="D"),
+        "rv_1d": rng.normal(size=n),
+        "y": rng.normal(size=n),
+        "inside": [i % 7 == 0 for i in range(n)],
+        "outside": [i % 11 == 0 for i in range(n)],
+    })
+    df["neither"] = ~(df["inside"] | df["outside"])
+
+    out = walk_forward(
+        df,
+        ["rv_1d"],
+        "y",
+        init_window=12,
+        model_type="ridge",
+        class_feature_cols=["rv_1d"],
+    )
+
+    assert {"score_inside_raw", "score_outside_raw", "score_neither_raw"}.issubset(out.columns)
+    assert {"p_inside", "p_outside", "p_neither"}.issubset(out.columns)
+    assert np.allclose(out[["p_inside", "p_outside", "p_neither"]].sum(axis=1), 1.0)

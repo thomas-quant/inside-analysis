@@ -19,6 +19,64 @@ WALK_FORWARD_INIT = 252   # initial training window (trading days)
 ALPHA_PI = 0.10           # 1 - confidence level → 90% PI
 
 
+def normalize_event_probabilities(p_inside, p_outside) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Clip two event probabilities and rescale so inside/outside/neither sums to 1."""
+    p_in = np.asarray(p_inside, dtype=float)
+    p_out = np.asarray(p_outside, dtype=float)
+    p_in = np.nan_to_num(p_in, nan=0.0, posinf=1.0, neginf=0.0).clip(0.0, 1.0)
+    p_out = np.nan_to_num(p_out, nan=0.0, posinf=1.0, neginf=0.0).clip(0.0, 1.0)
+    total = p_in + p_out
+    too_high = total > 1.0
+    if np.any(too_high):
+        p_in = p_in.copy()
+        p_out = p_out.copy()
+        p_in[too_high] = p_in[too_high] / total[too_high]
+        p_out[too_high] = p_out[too_high] / total[too_high]
+    p_nei = 1.0 - p_in - p_out
+    return p_in, p_out, p_nei
+
+
+def rolling_platt_calibrate(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    min_samples: int = 100,
+    min_pos: int = 10,
+    min_neg: int = 10,
+) -> np.ndarray:
+    """
+    Convert raw ranking scores into probabilities using only prior OOS rows.
+
+    Row i is calibrated on rows [:i], so the current label can never influence
+    its own probability. Falls back to the prior base rate until enough prior
+    positives and negatives exist.
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    s = np.asarray(scores, dtype=float)
+    y = np.asarray(labels, dtype=bool)
+    out = np.zeros(len(s), dtype=float)
+
+    for i in range(len(s)):
+        prior_scores = s[:i]
+        prior_labels = y[:i]
+        valid = np.isfinite(prior_scores)
+        prior_scores = prior_scores[valid]
+        prior_labels = prior_labels[valid]
+
+        n_pos = int(prior_labels.sum())
+        n_neg = int(len(prior_labels) - n_pos)
+        if len(prior_labels) >= min_samples and n_pos >= min_pos and n_neg >= min_neg:
+            clf = LogisticRegression(C=1.0, solver="lbfgs", max_iter=300)
+            clf.fit(prior_scores.reshape(-1, 1), prior_labels.astype(int))
+            out[i] = float(clf.predict_proba(np.array([[s[i]]]))[0, 1])
+        elif len(prior_labels) > 0:
+            out[i] = float(prior_labels.mean())
+        else:
+            out[i] = 0.0
+
+    return out.clip(0.0, 1.0)
+
+
 def ols_predict_with_pi(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -98,14 +156,14 @@ def compute_probabilities(
     clf_type: str = "logistic",
 ) -> tuple:
     """
-    Calibrated classification probabilities via logistic regression on the full
-    feature matrix. Using all features directly (rather than the compressed y_hat
-    scalar) gives substantially better AUC for inside/outside day classification.
+    Raw inside/outside ranking scores via a classifier on the full feature matrix.
+    Rolling calibration is applied later to keep ranking separate from probability
+    estimation.
 
     X_train / X_test must be on the same scale; pass scaler to reuse the
     regression scaler when available (avoids fitting a second scaler).
 
-    Returns p_inside, p_outside, p_neither.
+    Returns score_inside_raw, score_outside_raw, score_neither_raw.
     """
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler as SS
@@ -122,7 +180,9 @@ def compute_probabilities(
         Xs_te = sc.transform(X_test)
 
     def _clf_prob(labels):
-        if labels.sum() < 5:
+        n_pos = int(labels.sum())
+        n_neg = int(len(labels) - n_pos)
+        if n_pos < 5 or n_neg < 5:
             return float(labels.mean())
         if clf_type == "logistic":
             clf = LogisticRegression(C=0.1, max_iter=300, solver="lbfgs", class_weight=class_weight)
@@ -202,7 +262,7 @@ def walk_forward(
                 X_train, y_train, X_test, scaler, ridge_alpha=ridge_alpha
             )
 
-        p_in, p_out, p_nei = compute_probabilities(
+        score_in, score_out, score_nei = compute_probabilities(
             X_test_clf, X_train_clf, is_inside_next, is_outside_next,
             class_weight="balanced",
         )
@@ -214,9 +274,9 @@ def walk_forward(
             "pi_lower_90":    float(pi_lo[0]),
             "pi_upper_90":    float(pi_hi[0]),
             "sigma":          float(sigma),
-            "p_inside":       float(p_in),
-            "p_outside":      float(p_out),
-            "p_neither":      float(p_nei),
+            "score_inside_raw":  float(score_in),
+            "score_outside_raw": float(score_out),
+            "score_neither_raw": float(score_nei),
             "true_inside":    bool(test["inside_next"].iloc[0]),
             "true_outside":   bool(test["outside_next"].iloc[0]),
             "true_neither":   bool(test["neither_next"].iloc[0]),
@@ -225,7 +285,14 @@ def walk_forward(
         if t % 100 == 0:
             print(f"  Walk-forward step {t}/{n}")
 
-    return pd.DataFrame(records)
+    result = pd.DataFrame(records)
+    p_in = rolling_platt_calibrate(result["score_inside_raw"].values, result["true_inside"].values)
+    p_out = rolling_platt_calibrate(result["score_outside_raw"].values, result["true_outside"].values)
+    p_in, p_out, p_nei = normalize_event_probabilities(p_in, p_out)
+    result["p_inside"] = p_in
+    result["p_outside"] = p_out
+    result["p_neither"] = p_nei
+    return result
 
 
 def run_session_models() -> None:

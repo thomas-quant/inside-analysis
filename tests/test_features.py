@@ -151,7 +151,7 @@ def test_calendar_features_ignore_events_after_market_data_end(rth_daily_es, eco
     from feature_engineering import compute_calendar_features
     df = compute_calendar_features(rth_daily_es, eco)
     last = df.iloc[-1]
-    assert last["trade_date"] == pd.Timestamp("2025-11-21")
+    assert last["trade_date"] == rth_daily_es["trade_date"].max()
     assert int(last["high_impact_tomorrow"]) == 0
     assert int(last["n_events_next_2d"]) == 0
 
@@ -312,6 +312,8 @@ def test_finalize_feature_frames_returns_eth_and_rth_outputs():
     for result in outputs.values():
         assert {"inside", "outside", "neither", "y", "range_percentile_22"}.issubset(result.columns)
         assert "es_nq_rv_ratio" in result.columns
+        assert "es_nq_outside_divergence" in result.columns
+        assert "one_side_break" in result.columns
         assert pd.isna(result["y"].iloc[-1])
 
 
@@ -336,3 +338,65 @@ def test_pattern_features_include_nr_wr_and_streaks():
 
     assert out.loc[4, "nr4_flag"] == 1
     assert out.loc[5, "wr4_flag"] == 1
+
+
+def test_pattern_features_include_breakout_context():
+    import pandas as pd
+    from feature_engineering import compute_range_features, add_target, compute_pattern_features
+
+    df = pd.DataFrame({
+        "trade_date": pd.date_range("2024-01-01", periods=4, freq="D"),
+        "Open": [100, 101, 101, 101],
+        "High": [110, 112, 111, 113],
+        "Low": [90, 91, 89, 88],
+        "Close": [105, 111, 90, 100],
+        "Volume": [1, 1, 1, 1],
+    })
+
+    out = compute_pattern_features(add_target(compute_range_features(df)))
+
+    assert bool(out.loc[1, "break_high"]) is True
+    assert bool(out.loc[1, "break_low"]) is False
+    assert bool(out.loc[1, "high_only_break"]) is True
+    assert bool(out.loc[1, "one_side_break"]) is True
+    assert bool(out.loc[2, "low_only_break"]) is True
+    assert bool(out.loc[3, "outside"]) is True
+    assert bool(out.loc[3, "one_side_break"]) is False
+    assert out.loc[1, "dist_to_prev_high"] == 0.0
+    assert out.loc[2, "dist_to_prev_low"] == 0.0
+
+
+def test_cross_instrument_features_include_observed_divergence_without_future_rows():
+    import pandas as pd
+    from feature_engineering import compute_cross_instrument_features
+
+    es = pd.DataFrame({
+        "trade_date": pd.date_range("2024-01-01", periods=5, freq="D"),
+        "High": [110, 112, 113, 114, 113],
+        "Low": [90, 91, 89, 88, 89],
+        "range_abs": [20, 21, 24, 26, 24],
+        "rv_1d": [1, 2, 3, 4, 5],
+    })
+    nq = pd.DataFrame({
+        "trade_date": pd.date_range("2024-01-01", periods=5, freq="D"),
+        "High": [210, 211, 212, 211, 213],
+        "Low": [190, 189, 188, 189, 187],
+        "range_abs": [20, 22, 24, 22, 26],
+        "rv_1d": [2, 2, 2, 2, 2],
+    })
+
+    es_out, nq_out = compute_cross_instrument_features(es, nq)
+
+    required = {
+        "both_outside",
+        "es_nq_outside_divergence",
+        "nq_outside_es_one_side",
+        "es_outside_nq_one_side",
+        "cross_outside_divergence_rate_5",
+    }
+    assert required.issubset(es_out.columns)
+    assert required.issubset(nq_out.columns)
+    assert int(es_out.loc[1, "es_nq_outside_divergence"]) == 1
+    assert int(es_out.loc[1, "nq_outside_es_one_side"]) == 1
+    assert int(es_out.loc[2, "both_outside"]) == 1
+    assert es_out.loc[1, "cross_outside_divergence_rate_5"] == 1.0
