@@ -16,6 +16,7 @@ from pathlib import Path
 from scipy import stats
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score
 
 from feature_engineering import (
     FEATURE_COLS_HAR, FEATURE_COLS_ALL, TARGET_COL, LABEL_COLS
@@ -56,6 +57,58 @@ def diebold_mariano(e1, e2):
     dm_stat = d.mean() / (d.std(ddof=1) / np.sqrt(n))
     p_val = 2 * stats.norm.sf(abs(dm_stat))
     return dm_stat, p_val
+
+
+def _safe_auc(y_true, score):
+    y = pd.Series(y_true).astype(int)
+    if y.nunique() < 2:
+        return np.nan
+    return float(roc_auc_score(y, score))
+
+
+def _precision_at_fraction(y_true, score, fraction: float):
+    y = pd.Series(y_true).astype(float).reset_index(drop=True)
+    s = pd.Series(score).astype(float).reset_index(drop=True)
+    n = len(y)
+    if n == 0:
+        return np.nan
+    k = max(1, int(np.ceil(n * fraction)))
+    idx = s.sort_values(ascending=False).index[:k]
+    return float(y.loc[idx].mean())
+
+
+def classification_metrics(preds: pd.DataFrame, symbol: str, session: str, model_name: str) -> list[dict]:
+    """Ranking and calibration metrics for inside/outside event forecasts."""
+    rows = []
+    for target in ["inside", "outside"]:
+        p_col = f"p_{target}"
+        score_col = f"score_{target}_raw"
+        true_col = f"true_{target}"
+        y = preds[true_col].astype(bool)
+        p = preds[p_col].astype(float)
+        score = preds[score_col].astype(float) if score_col in preds else p
+        base_rate = float(y.mean())
+        brier = brier_score(p, y)
+        naive = base_rate * (1.0 - base_rate)
+
+        row = {
+            "symbol": symbol,
+            "session": session,
+            "model": model_name,
+            "target": target,
+            "base_rate": base_rate,
+            "auc": _safe_auc(y, score),
+            "brier": brier,
+            "brier_naive": naive,
+            "brier_skill": np.nan if naive == 0 else 1.0 - brier / naive,
+            "n_test_days": len(preds),
+        }
+        for frac, label in [(0.05, "5"), (0.10, "10"), (0.20, "20")]:
+            precision = _precision_at_fraction(y, score, frac)
+            row[f"precision_top_{label}"] = precision
+            row[f"lift_top_{label}"] = np.nan if base_rate == 0 else precision / base_rate
+        rows.append(row)
+    return rows
 
 
 # ── Feature importance ────────────────────────────────────────────────────────
@@ -151,6 +204,7 @@ def plot_feature_importance(importance: pd.DataFrame, symbol: str):
 def run_session_evaluation() -> pd.DataFrame:
     """Evaluate HAR/Ridge predictions for ES/NQ across ETH and RTH targets."""
     all_metrics = []
+    all_classification_metrics = []
 
     for symbol in ["es", "nq"]:
         for session in ["eth", "rth"]:
@@ -189,6 +243,9 @@ def run_session_evaluation() -> pd.DataFrame:
                     "brier_outside": bs_out,
                     "n_test_days": len(preds),
                 })
+                all_classification_metrics.extend(
+                    classification_metrics(preds, symbol.upper(), session.upper(), model_name)
+                )
 
                 plot_label = f"{symbol.upper()}_{session.upper()}"
                 plot_actual_vs_predicted(preds, plot_label, model_name)
@@ -211,8 +268,11 @@ def run_session_evaluation() -> pd.DataFrame:
             print(imp[["feature", "coef", "abs_coef"]].head(10).to_string(index=False))
 
     metrics_df = pd.DataFrame(all_metrics)
+    classification_df = pd.DataFrame(all_classification_metrics)
     metrics_df.to_csv("output/metrics_summary.csv", index=False)
+    classification_df.to_csv("output/classification_metrics_summary.csv", index=False)
     print(f"\n\nSaved output/metrics_summary.csv")
+    print("Saved output/classification_metrics_summary.csv")
     print(metrics_df.to_string(index=False))
     return metrics_df
 
