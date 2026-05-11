@@ -196,6 +196,16 @@ def test_normalize_event_probabilities_clips_and_rescales():
     assert np.all((0.0 <= p_neither) & (p_neither <= 1.0))
 
 
+def test_normalize_event_probabilities_preserves_inside_priority():
+    from model import normalize_event_probabilities
+
+    p_inside, p_outside, p_neither = normalize_event_probabilities([0.8], [0.7])
+
+    assert p_inside[0] == pytest.approx(0.8)
+    assert p_outside[0] == pytest.approx(0.2)
+    assert p_neither[0] == pytest.approx(0.0)
+
+
 def test_walk_forward_emits_raw_scores_and_calibrated_probabilities():
     from model import walk_forward
 
@@ -222,3 +232,40 @@ def test_walk_forward_emits_raw_scores_and_calibrated_probabilities():
     assert {"score_inside_raw", "score_outside_raw", "score_neither_raw"}.issubset(out.columns)
     assert {"p_inside", "p_outside", "p_neither"}.issubset(out.columns)
     assert np.allclose(out[["p_inside", "p_outside", "p_neither"]].sum(axis=1), 1.0)
+
+
+def test_walk_forward_appends_regression_context_to_classifier(monkeypatch):
+    import model
+    from model import walk_forward
+
+    n = 24
+    rng = np.random.default_rng(321)
+    df = pd.DataFrame({
+        "trade_date": pd.date_range("2024-01-01", periods=n, freq="D"),
+        "rv_1d": np.linspace(0.1, 2.4, n),
+        "y": rng.normal(size=n),
+        "inside": [i % 6 == 0 for i in range(n)],
+        "outside": [i % 8 == 0 for i in range(n)],
+    })
+    df["neither"] = ~(df["inside"] | df["outside"])
+
+    seen_shapes = []
+
+    def fake_probabilities(X_test, X_train, labels_inside_next, labels_outside_next, **kwargs):
+        seen_shapes.append((X_train.shape, X_test.shape))
+        return 0.2, 0.1, 0.7
+
+    monkeypatch.setattr(model, "compute_probabilities", fake_probabilities)
+
+    walk_forward(
+        df,
+        ["rv_1d"],
+        "y",
+        init_window=12,
+        model_type="ridge",
+        class_feature_cols=["rv_1d"],
+        add_regression_context_to_classifier=True,
+    )
+
+    assert seen_shapes
+    assert all(train_shape[1] == 4 and test_shape[1] == 4 for train_shape, test_shape in seen_shapes)

@@ -119,3 +119,49 @@ def test_run_session_evaluation_writes_classification_summary(monkeypatch):
     assert "output/classification_metrics_summary.csv" in written
     cls = written["output/classification_metrics_summary.csv"]
     assert set(cls["target"]) == {"inside", "outside"}
+
+
+def test_run_session_evaluation_writes_inside_model_comparison(monkeypatch):
+    import evaluate
+
+    def preds(symbol, session, model):
+        return pd.DataFrame({
+            "trade_date": pd.date_range("2024-01-01", periods=10),
+            "y_true": [0.0] * 10,
+            "y_hat": [0.0] * 10,
+            "pi_lower_90": [-1.0] * 10,
+            "pi_upper_90": [1.0] * 10,
+            "p_inside": [0.2, 0.8, 0.7, 0.2, 0.1, 0.3, 0.2, 0.1, 0.4, 0.1],
+            "p_outside": [0.1] * 10,
+            "score_inside_raw": [0.1, 0.9, 0.8, 0.2, 0.1, 0.3, 0.2, 0.1, 0.4, 0.1],
+            "score_inside_raw_hgb": [0.2, 0.7, 0.6, 0.3, 0.2, 0.4, 0.3, 0.2, 0.5, 0.2],
+            "score_outside_raw": [0.1] * 10,
+            "true_inside": [False, True, True, False, False, False, False, False, False, False],
+            "true_outside": [False] * 10,
+        })
+
+    def fake_read_parquet(path):
+        if path.startswith("output/predictions_"):
+            return preds("es", "eth", "ridge")
+        return pd.DataFrame({"feature": [1, 2, 3]})
+
+    written = {}
+
+    def fake_to_csv(self, path, index=False):
+        written[path] = self.copy()
+
+    monkeypatch.setattr(pd, "read_parquet", fake_read_parquet)
+    monkeypatch.setattr(evaluate, "plot_actual_vs_predicted", lambda *args, **kwargs: None)
+    monkeypatch.setattr(evaluate, "plot_probability_calibration", lambda *args, **kwargs: None)
+    monkeypatch.setattr(evaluate, "plot_feature_importance", lambda *args, **kwargs: None)
+    monkeypatch.setattr(evaluate, "compute_feature_importance", lambda df, symbol: pd.DataFrame({
+        "feature": ["x"], "coef": [1.0], "abs_coef": [1.0], "symbol": [symbol],
+    }))
+    monkeypatch.setattr(pd.DataFrame, "to_csv", fake_to_csv)
+
+    evaluate.run_session_evaluation()
+
+    assert "output/inside_model_comparison.csv" in written
+    comparison = written["output/inside_model_comparison.csv"]
+    assert {"selected", "hgb"}.issubset(set(comparison["inside_score_source"]))
+    assert set(comparison["target"]) == {"inside"}
