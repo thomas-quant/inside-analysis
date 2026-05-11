@@ -111,6 +111,51 @@ def classification_metrics(preds: pd.DataFrame, symbol: str, session: str, model
     return rows
 
 
+def inside_model_comparison_metrics(preds: pd.DataFrame, symbol: str, session: str, model_name: str) -> list[dict]:
+    """Compare inside-day ranking score sources, with ETH intended as primary target."""
+    from model import rolling_platt_calibrate
+
+    selected_score_col = "score_inside_raw" if "score_inside_raw" in preds.columns else "p_inside"
+    score_sources = [("selected", selected_score_col)]
+    if "score_inside_raw_hgb" in preds.columns and preds["score_inside_raw_hgb"].notna().any():
+        score_sources.append(("hgb", "score_inside_raw_hgb"))
+
+    y = preds["true_inside"].astype(bool)
+    base_rate = float(y.mean())
+    rows = []
+    for source_name, score_col in score_sources:
+        score = preds[score_col].astype(float)
+        if source_name == "selected" and "p_inside" in preds:
+            p = preds["p_inside"].astype(float)
+        else:
+            p = pd.Series(
+                rolling_platt_calibrate(score.values, y.values),
+                index=preds.index,
+                dtype=float,
+            )
+        brier = brier_score(p, y)
+        naive = base_rate * (1.0 - base_rate)
+        row = {
+            "symbol": symbol,
+            "session": session,
+            "model": model_name,
+            "target": "inside",
+            "inside_score_source": source_name,
+            "base_rate": base_rate,
+            "auc": _safe_auc(y, score),
+            "brier": brier,
+            "brier_naive": naive,
+            "brier_skill": np.nan if naive == 0 else 1.0 - brier / naive,
+            "n_test_days": len(preds),
+        }
+        for frac, label in [(0.05, "5"), (0.10, "10"), (0.20, "20")]:
+            precision = _precision_at_fraction(y, score, frac)
+            row[f"precision_top_{label}"] = precision
+            row[f"lift_top_{label}"] = np.nan if base_rate == 0 else precision / base_rate
+        rows.append(row)
+    return rows
+
+
 # ── Feature importance ────────────────────────────────────────────────────────
 
 def compute_feature_importance(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
@@ -205,6 +250,7 @@ def run_session_evaluation() -> pd.DataFrame:
     """Evaluate HAR/Ridge predictions for ES/NQ across ETH and RTH targets."""
     all_metrics = []
     all_classification_metrics = []
+    all_inside_comparison_metrics = []
 
     for symbol in ["es", "nq"]:
         for session in ["eth", "rth"]:
@@ -246,6 +292,9 @@ def run_session_evaluation() -> pd.DataFrame:
                 all_classification_metrics.extend(
                     classification_metrics(preds, symbol.upper(), session.upper(), model_name)
                 )
+                all_inside_comparison_metrics.extend(
+                    inside_model_comparison_metrics(preds, symbol.upper(), session.upper(), model_name)
+                )
 
                 plot_label = f"{symbol.upper()}_{session.upper()}"
                 plot_actual_vs_predicted(preds, plot_label, model_name)
@@ -269,10 +318,13 @@ def run_session_evaluation() -> pd.DataFrame:
 
     metrics_df = pd.DataFrame(all_metrics)
     classification_df = pd.DataFrame(all_classification_metrics)
+    inside_comparison_df = pd.DataFrame(all_inside_comparison_metrics)
     metrics_df.to_csv("output/metrics_summary.csv", index=False)
     classification_df.to_csv("output/classification_metrics_summary.csv", index=False)
+    inside_comparison_df.to_csv("output/inside_model_comparison.csv", index=False)
     print(f"\n\nSaved output/metrics_summary.csv")
     print("Saved output/classification_metrics_summary.csv")
+    print("Saved output/inside_model_comparison.csv")
     print(metrics_df.to_string(index=False))
     return metrics_df
 

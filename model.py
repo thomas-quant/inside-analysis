@@ -6,6 +6,7 @@ Outputs: output/predictions_{es,nq}_{har,ridge}.parquet
 
 import pandas as pd
 import numpy as np
+import os
 from pathlib import Path
 from scipy import stats
 from sklearn.linear_model import LinearRegression, Ridge
@@ -20,18 +21,12 @@ ALPHA_PI = 0.10           # 1 - confidence level → 90% PI
 
 
 def normalize_event_probabilities(p_inside, p_outside) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Clip two event probabilities and rescale so inside/outside/neither sums to 1."""
+    """Clip event probabilities, preserving p_inside when outside must be reduced."""
     p_in = np.asarray(p_inside, dtype=float)
     p_out = np.asarray(p_outside, dtype=float)
     p_in = np.nan_to_num(p_in, nan=0.0, posinf=1.0, neginf=0.0).clip(0.0, 1.0)
     p_out = np.nan_to_num(p_out, nan=0.0, posinf=1.0, neginf=0.0).clip(0.0, 1.0)
-    total = p_in + p_out
-    too_high = total > 1.0
-    if np.any(too_high):
-        p_in = p_in.copy()
-        p_out = p_out.copy()
-        p_in[too_high] = p_in[too_high] / total[too_high]
-        p_out[too_high] = p_out[too_high] / total[too_high]
+    p_out = np.minimum(p_out, 1.0 - p_in)
     p_nei = 1.0 - p_in - p_out
     return p_in, p_out, p_nei
 
@@ -189,9 +184,14 @@ def compute_probabilities(
         elif clf_type == "hgb":
             from sklearn.ensemble import HistGradientBoostingClassifier
             clf = HistGradientBoostingClassifier(
-                max_iter=100, learning_rate=0.05, max_leaf_nodes=15, random_state=42
+                max_iter=30, learning_rate=0.05, max_leaf_nodes=15, random_state=42
             )
-        clf.fit(Xs_tr, labels.astype(int))
+        fit_kwargs = {}
+        if clf_type == "hgb" and class_weight == "balanced":
+            pos_weight = len(labels) / (2.0 * n_pos)
+            neg_weight = len(labels) / (2.0 * n_neg)
+            fit_kwargs["sample_weight"] = np.where(labels, pos_weight, neg_weight)
+        clf.fit(Xs_tr, labels.astype(int), **fit_kwargs)
         return float(clf.predict_proba(Xs_te)[0, 1])
 
     p_in  = _clf_prob(labels_inside_next)
@@ -209,6 +209,8 @@ def walk_forward(
     model_type: str = "ols",
     ridge_alpha: float = 1.0,
     class_feature_cols: list | None = None,
+    add_regression_context_to_classifier: bool = True,
+    include_inside_hgb_candidate: bool = False,
 ) -> pd.DataFrame:
     """
     Expanding walk-forward validation.
@@ -255,17 +257,35 @@ def walk_forward(
         is_outside_next = train["outside_next"].values
 
         if model_type == "ols":
-            y_hat, pi_lo, pi_hi, _, sigma = ols_predict_with_pi(X_train, y_train, X_test)
+            y_hat, pi_lo, pi_hi, fitted_reg, sigma = ols_predict_with_pi(X_train, y_train, X_test)
+            y_hat_train = fitted_reg.predict(X_train)
         else:
             scaler = StandardScaler().fit(X_train)
-            y_hat, pi_lo, pi_hi, sigma, _ = ridge_predict_with_pi(
+            y_hat, pi_lo, pi_hi, sigma, fitted_reg = ridge_predict_with_pi(
                 X_train, y_train, X_test, scaler, ridge_alpha=ridge_alpha
             )
+            y_hat_train = fitted_reg.predict(scaler.transform(X_train))
+
+        if add_regression_context_to_classifier:
+            train_context = np.column_stack([
+                y_hat_train,
+                np.full(len(train), float(sigma)),
+                np.full(len(train), float(pi_hi[0] - pi_lo[0])),
+            ])
+            test_context = np.array([[float(y_hat[0]), float(sigma), float(pi_hi[0] - pi_lo[0])]])
+            X_train_clf = np.hstack([X_train_clf, train_context])
+            X_test_clf = np.hstack([X_test_clf, test_context])
 
         score_in, score_out, score_nei = compute_probabilities(
             X_test_clf, X_train_clf, is_inside_next, is_outside_next,
             class_weight="balanced",
         )
+        score_in_hgb = np.nan
+        if include_inside_hgb_candidate:
+            score_in_hgb, _, _ = compute_probabilities(
+                X_test_clf, X_train_clf, is_inside_next, is_outside_next,
+                class_weight="balanced", clf_type="hgb",
+            )
 
         records.append({
             "trade_date":     test["trade_date"].iloc[0],
@@ -275,6 +295,7 @@ def walk_forward(
             "pi_upper_90":    float(pi_hi[0]),
             "sigma":          float(sigma),
             "score_inside_raw":  float(score_in),
+            "score_inside_raw_hgb": float(score_in_hgb),
             "score_outside_raw": float(score_out),
             "score_neither_raw": float(score_nei),
             "true_inside":    bool(test["inside_next"].iloc[0]),
@@ -316,8 +337,11 @@ def run_session_models() -> None:
             print(f"  Saved {har_path}  ({len(har)} rows)")
 
             print(f"  {symbol.upper()} {session.upper()} — Full Ridge model")
-            ridge = walk_forward(df, FEATURE_COLS_ALL, TARGET_COL,
-                                 init_window=WALK_FORWARD_INIT, model_type="ridge")
+            ridge = walk_forward(
+                df, FEATURE_COLS_ALL, TARGET_COL,
+                init_window=WALK_FORWARD_INIT, model_type="ridge",
+                include_inside_hgb_candidate=os.environ.get("RUN_INSIDE_HGB") == "1",
+            )
             ridge["model"] = "Full_Ridge"
             ridge["session"] = session.upper()
             ridge_path = f"output/predictions_{symbol}_{session}_ridge.parquet"
