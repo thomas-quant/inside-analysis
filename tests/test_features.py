@@ -400,3 +400,75 @@ def test_cross_instrument_features_include_observed_divergence_without_future_ro
     assert int(es_out.loc[1, "nq_outside_es_one_side"]) == 1
     assert int(es_out.loc[2, "both_outside"]) == 1
     assert es_out.loc[1, "cross_outside_divergence_rate_5"] == 1.0
+
+
+def test_rv_features_include_inside_day_compression_diagnostics():
+    import pandas as pd
+    import numpy as np
+    from feature_engineering import compute_rv_features
+
+    trade_dates = pd.date_range("2024-01-02", periods=25, freq="D")
+    daily = pd.DataFrame({
+        "trade_date": trade_dates,
+        "Open": np.linspace(100, 124, 25),
+        "High": np.linspace(101, 125, 25),
+        "Low": np.linspace(99, 123, 25),
+        "Close": np.linspace(100.5, 124.5, 25),
+        "Volume": [1000] * 25,
+    })
+    rows = []
+    for day_idx, date in enumerate(trade_dates):
+        base = 100 + day_idx
+        for minute, close_offset in enumerate([0.0, 0.1, -0.05, 0.2]):
+            dt = date + pd.Timedelta(hours=9, minutes=30 + minute)
+            close = base + close_offset
+            rows.append({
+                "DateTime_ET": dt,
+                "Open": close - 0.02,
+                "High": close + 0.05,
+                "Low": close - 0.05,
+                "Close": close,
+                "Volume": 100,
+            })
+    raw = pd.DataFrame(rows)
+
+    out = compute_rv_features(daily, raw, session="rth")
+
+    required = {
+        "bpv_1d", "jump_variation", "jump_ratio", "continuous_rv",
+        "rv_skew_1d", "rv_kurt_1d", "rv_neg_1d", "rv_pos_1d",
+        "rv_asymmetry_1d", "vov_22d",
+    }
+    assert required.issubset(out.columns)
+    assert out["jump_ratio"].dropna().between(0.0, 1.0).all()
+    assert out["rv_asymmetry_1d"].dropna().between(-1.0, 1.0).all()
+
+
+def test_volume_features_include_vwap_deviation():
+    import pandas as pd
+    from feature_engineering import compute_volume_features
+
+    daily = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2024-01-02"]),
+        "Open": [100.0],
+        "High": [110.0],
+        "Low": [90.0],
+        "Close": [108.0],
+        "Volume": [300.0],
+        "range_abs": [20.0],
+    })
+    raw = pd.DataFrame({
+        "DateTime_ET": pd.to_datetime([
+            "2024-01-02 09:30", "2024-01-02 09:31", "2024-01-02 09:32",
+        ]),
+        "Open": [100.0, 102.0, 104.0],
+        "High": [101.0, 103.0, 105.0],
+        "Low": [99.0, 101.0, 103.0],
+        "Close": [100.0, 102.0, 104.0],
+        "Volume": [100.0, 100.0, 100.0],
+    })
+
+    out = compute_volume_features(daily, raw)
+
+    assert "vwap_deviation" in out.columns
+    assert out.loc[0, "vwap_deviation"] == pytest.approx(abs(102.0 - 108.0) / 20.0)

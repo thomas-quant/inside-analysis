@@ -97,12 +97,37 @@ def compute_rv_features(daily: pd.DataFrame, raw_1min: pd.DataFrame,
     # Zero out cross-session returns (first bar of each trade_date)
     bars.loc[bars["trade_date"] != bars["trade_date"].shift(1), "log_ret"] = np.nan
 
-    rv_series = (
-        bars.groupby("trade_date")["log_ret"]
-        .apply(lambda r: (r ** 2).sum())
-        .rename("rv_1d")
+    bars["log_ret_sq"] = bars["log_ret"] ** 2
+    bars["log_ret_cube"] = bars["log_ret"] ** 3
+    bars["log_ret_fourth"] = bars["log_ret"] ** 4
+    bars["rv_neg_component"] = bars["log_ret_sq"].where(bars["log_ret"] < 0, 0.0)
+    bars["rv_pos_component"] = bars["log_ret_sq"].where(bars["log_ret"] > 0, 0.0)
+    abs_ret = bars["log_ret"].abs()
+    bars["abs_ret_pair"] = abs_ret * abs_ret.groupby(bars["trade_date"]).shift(1)
+
+    rv_diag = (
+        bars.groupby("trade_date")
+        .agg(
+            rv_1d=("log_ret_sq", "sum"),
+            abs_ret_pair=("abs_ret_pair", "sum"),
+            sum_cube=("log_ret_cube", "sum"),
+            sum_fourth=("log_ret_fourth", "sum"),
+            rv_neg_1d=("rv_neg_component", "sum"),
+            rv_pos_1d=("rv_pos_component", "sum"),
+        )
         .reset_index()
     )
+    rv_diag["bpv_1d"] = (np.pi / 2.0) * rv_diag["abs_ret_pair"]
+    positive_rv = rv_diag["rv_1d"] > 0
+    rv_diag["rv_skew_1d"] = np.nan
+    rv_diag["rv_kurt_1d"] = np.nan
+    rv_diag.loc[positive_rv, "rv_skew_1d"] = (
+        rv_diag.loc[positive_rv, "sum_cube"] / (rv_diag.loc[positive_rv, "rv_1d"] ** 1.5)
+    )
+    rv_diag.loc[positive_rv, "rv_kurt_1d"] = (
+        rv_diag.loc[positive_rv, "sum_fourth"] / (rv_diag.loc[positive_rv, "rv_1d"] ** 2)
+    )
+    rv_diag = rv_diag.drop(columns=["abs_ret_pair", "sum_cube", "sum_fourth"])
 
     # For Parkinson: use session H and L
     hl = (
@@ -111,12 +136,19 @@ def compute_rv_features(daily: pd.DataFrame, raw_1min: pd.DataFrame,
         .reset_index()
     )
 
-    out = daily.merge(rv_series, on="trade_date", how="left")
+    out = daily.merge(rv_diag, on="trade_date", how="left")
     out = out.merge(hl, on="trade_date", how="left")
 
     out["rv_5d"]  = out["rv_1d"].rolling(5,  min_periods=3).mean()
     out["rv_22d"] = out["rv_1d"].rolling(22, min_periods=10).mean()
+    out["vov_22d"] = out["rv_1d"].rolling(22, min_periods=10).std()
     out["rv_ratio_1_5"] = out["rv_1d"] / out["rv_5d"]
+    out["continuous_rv"] = out["bpv_1d"]
+    out["jump_variation"] = (out["rv_1d"] - out["bpv_1d"]).clip(lower=0.0)
+    out["jump_ratio"] = (out["jump_variation"] / out["rv_1d"]).replace([np.inf, -np.inf], np.nan).clip(0.0, 1.0)
+    out["rv_asymmetry_1d"] = (
+        (out["rv_neg_1d"] - out["rv_pos_1d"]) / out["rv_1d"]
+    ).replace([np.inf, -np.inf], np.nan).clip(-1.0, 1.0)
     out["rv_percentile_252"] = (
         out["rv_1d"]
         .rolling(252, min_periods=30)
@@ -185,6 +217,24 @@ def compute_volume_features(df: pd.DataFrame, raw_1min: pd.DataFrame) -> pd.Data
     out = out.merge(nyam_vol, on="trade_date", how="left")
     out["volume_first_hour_pct"] = out["nyam_vol"] / out["Volume"]
     out = out.drop(columns=["nyam_vol"])
+
+    rth = raw_1min[
+        (raw_1min["DateTime_ET"].dt.time >= RTH_START) &
+        (raw_1min["DateTime_ET"].dt.time <= RTH_END)
+    ].copy()
+    rth["trade_date"] = rth["DateTime_ET"].dt.normalize()
+    rth["dollar_volume"] = rth["Close"] * rth["Volume"]
+    vwap = (
+        rth.groupby("trade_date")
+        .agg(dollar_volume=("dollar_volume", "sum"), vwap_volume=("Volume", "sum"))
+        .reset_index()
+    )
+    vwap["vwap"] = vwap["dollar_volume"] / vwap["vwap_volume"].replace(0, np.nan)
+    vwap = vwap[["trade_date", "vwap"]]
+    out = out.merge(vwap, on="trade_date", how="left")
+    denom = out["range_abs"] if "range_abs" in out.columns else (out["High"] - out["Low"])
+    out["vwap_deviation"] = ((out["vwap"] - out["Close"]).abs() / denom).replace([np.inf, -np.inf], np.nan)
+    out = out.drop(columns=["vwap"])
 
     return out
 
@@ -604,11 +654,14 @@ FEATURE_COLS_HAR = ["rv_1d", "rv_5d", "rv_22d"]
 FEATURE_COLS_ALL = [
     # Group 1 — Realized Volatility (computed on RTH session bars)
     "rv_1d", "rv_5d", "rv_22d", "rv_ratio_1_5", "rv_percentile_252", "parkinson_vol",
+    "bpv_1d", "jump_variation", "jump_ratio", "continuous_rv",
+    "rv_skew_1d", "rv_kurt_1d", "rv_neg_1d", "rv_pos_1d", "rv_asymmetry_1d", "vov_22d",
     # Group 2 — Range Structure (ETH daily bars)
     "range_pct_of_prev", "atr_ratio", "range_ma_5", "range_ma_22",
     "close_location", "overnight_gap",
     # Group 3 — Volume
     "volume_prev", "volume_zscore_22", "volume_rth_vs_globex", "volume_first_hour_pct",
+    "vwap_deviation",
     # Group 4 — Intraday Session (% of daily range)
     "nyam_range_pct", "london_range_pct", "asia_range_pct", "session_vol_entropy",
     # Group 4b — ETH/RTH Cross-session
