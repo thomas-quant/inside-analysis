@@ -44,6 +44,8 @@ PCX_FAILURE_SUMMARY_PATH = Path("output/pcx_failure_mode_summary.csv")
 PCX_FAILURE_SCORES_PATH = Path("output/pcx_failure_mode_scores.parquet")
 PCX_FAILURE_SLICE_PATH = Path("output/pcx_failure_mode_slice_eval.csv")
 PCX_FAILURE_YEARLY_BY_SLICE_PATH = Path("output/pcx_failure_mode_yearly_by_slice.csv")
+PCX_FAILURE_SIDE_SLICE_PATH = Path("output/pcx_failure_mode_side_slice_eval.csv")
+PCX_FAILURE_SELECTION_PATH = Path("output/pcx_failure_mode_selection.csv")
 
 FROZEN_SETUP = "pcx_ict"
 FROZEN_TARGET = "inside_failure"
@@ -276,12 +278,14 @@ def build_setup_frame(
     return frame.sort_values("trade_date").reset_index(drop=True), feature_cols
 
 
-def _fit_scores(model_name: str, X_train: np.ndarray, y_train: np.ndarray, X_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _fit_single_model_scores(
+    model_name: str,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
     n_pos = int(y_train.sum())
     n_neg = int(len(y_train) - n_pos)
-    if n_pos < 3 or n_neg < 3:
-        p = float(y_train.mean()) if len(y_train) else 0.0
-        return np.full(len(y_train), p), np.full(len(X_test), p)
     if model_name == "logistic":
         clf = LogisticRegression(C=0.1, max_iter=300, solver="lbfgs", class_weight="balanced")
         clf.fit(X_train, y_train.astype(int))
@@ -306,11 +310,65 @@ def _fit_scores(model_name: str, X_train: np.ndarray, y_train: np.ndarray, X_tes
     return clf.predict_proba(X_train)[:, 1].astype(float), clf.predict_proba(X_test)[:, 1].astype(float)
 
 
+def _rank_against_train(train_scores: np.ndarray, scores: np.ndarray) -> np.ndarray:
+    train = np.sort(np.asarray(train_scores, dtype=float))
+    if len(train) == 0:
+        return np.zeros(len(scores), dtype=float)
+    return np.searchsorted(train, np.asarray(scores, dtype=float), side="right") / len(train)
+
+
+def _fit_ensemble_scores(
+    model_name: str,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    base_models = ["logistic", "hgb", "xgb_gpu_depth2"]
+    train_parts = []
+    test_parts = []
+    for base_model in base_models:
+        try:
+            train_scores, test_scores = _fit_single_model_scores(base_model, X_train, y_train, X_test)
+        except RuntimeError:
+            if base_model.startswith("xgb_gpu"):
+                continue
+            raise
+        if model_name == "ensemble_rank_mean":
+            raw_train_scores = train_scores
+            train_scores = _rank_against_train(raw_train_scores, raw_train_scores)
+            test_scores = _rank_against_train(raw_train_scores, test_scores)
+        train_parts.append(train_scores)
+        test_parts.append(test_scores)
+    if not train_parts:
+        raise RuntimeError(f"{model_name} has no available base models")
+    return np.mean(train_parts, axis=0), np.mean(test_parts, axis=0)
+
+
+def _fit_scores(model_name: str, X_train: np.ndarray, y_train: np.ndarray, X_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    n_pos = int(y_train.sum())
+    n_neg = int(len(y_train) - n_pos)
+    if n_pos < 3 or n_neg < 3:
+        p = float(y_train.mean()) if len(y_train) else 0.0
+        return np.full(len(y_train), p), np.full(len(X_test), p)
+    if model_name in {"ensemble_mean", "ensemble_rank_mean"}:
+        return _fit_ensemble_scores(model_name, X_train, y_train, X_test)
+    return _fit_single_model_scores(model_name, X_train, y_train, X_test)
+
+
 def xgb_gpu_params(scale_pos_weight: float, model_name: str = "xgb_gpu") -> dict:
     """XGBoost >=3.1 CUDA params: use device, no removed gpu_id/predictor."""
     variants = {
         "xgb_gpu": {"max_depth": 3, "n_estimators": 160, "learning_rate": 0.04},
+        "xgb_gpu_depth1": {"max_depth": 1, "n_estimators": 260, "learning_rate": 0.035},
         "xgb_gpu_depth2": {"max_depth": 2, "n_estimators": 220, "learning_rate": 0.035},
+        "xgb_gpu_depth2_l1": {"max_depth": 2, "n_estimators": 220, "learning_rate": 0.035, "reg_alpha": 1.0},
+        "xgb_gpu_depth2_subsample": {
+            "max_depth": 2,
+            "n_estimators": 260,
+            "learning_rate": 0.03,
+            "subsample": 0.65,
+            "colsample_bytree": 0.65,
+        },
         "xgb_gpu_depth3": {"max_depth": 3, "n_estimators": 220, "learning_rate": 0.035},
         "xgb_gpu_depth4": {"max_depth": 4, "n_estimators": 180, "learning_rate": 0.03},
         "xgb_gpu_tuned": {"max_depth": 3, "n_estimators": 300, "learning_rate": 0.025},
@@ -340,6 +398,15 @@ def _should_skip_model_error(model_name: str, exc: Exception) -> bool:
 
 def _flag_name(fraction: float) -> str:
     return f"remove_top_{int(round(fraction * 100)):02d}"
+
+
+def parse_thresholds(value: str | None) -> list[float] | None:
+    if value is None or str(value).strip() == "":
+        return None
+    thresholds = [float(x.strip()) for x in str(value).split(",") if x.strip()]
+    if any(x <= 0 or x >= 1 for x in thresholds):
+        raise ValueError("thresholds must be fractions between 0 and 1")
+    return thresholds
 
 
 def _thresholds_from_train_scores(train_scores: np.ndarray, threshold_fractions: list[float]) -> dict[str, float]:
@@ -656,6 +723,73 @@ def build_slice_eval(
     return pd.DataFrame(rows)
 
 
+def build_side_slice_eval(
+    scores: pd.DataFrame,
+    slice_membership: pd.DataFrame,
+    filter_col: str = FROZEN_FILTER,
+) -> pd.DataFrame:
+    scored = scores.copy()
+    membership = slice_membership.copy()
+    scored["trade_date"] = _normalize_dates(scored["trade_date"]).to_numpy()
+    membership["trade_date"] = _normalize_dates(membership["trade_date"]).to_numpy()
+    joined = scored.merge(membership, on="trade_date", how="inner")
+    rows = []
+    group_cols = [c for c in ["setup", "target", "candidate_model"] if c in joined.columns]
+    grouped = joined.groupby(group_cols, dropna=False) if group_cols else [((), joined)]
+    for keys, score_group in grouped:
+        key_values = keys if isinstance(keys, tuple) else (keys,)
+        meta = dict(zip(group_cols, key_values))
+        for setup_col in [c for c in membership.columns if c != "trade_date"]:
+            setup_group = score_group[score_group[setup_col].astype(bool)]
+            for side in ["LONG", "SHORT"]:
+                side_group = setup_group[setup_group["direction"].eq(side)]
+                row = _summary_row_for_scores(side_group, filter_col) if len(side_group) else {
+                    "target": meta.get("target", np.nan),
+                    "candidate_model": meta.get("candidate_model", np.nan),
+                    "filter": filter_col,
+                    "base_n": 0,
+                    "base_hit_rate": np.nan,
+                    "kept_n": 0,
+                    "kept_hit_rate": np.nan,
+                    "removed_n": 0,
+                    "removed_hit_rate": np.nan,
+                    "delta_kept_vs_base": np.nan,
+                    "monthly_frequency_removed": 0.0,
+                }
+                row["train_setup"] = meta.get("setup", np.nan)
+                row["eval_setup"] = setup_col
+                row["side"] = side
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_selection_report(slice_eval: pd.DataFrame, min_removed_n: int = 20) -> pd.DataFrame:
+    if slice_eval.empty:
+        return pd.DataFrame()
+    rows = []
+    group_cols = ["target", "candidate_model", "filter"]
+    for keys, group in slice_eval.groupby(group_cols, dropna=False):
+        row = dict(zip(group_cols, keys))
+        ict = group[group["eval_setup"].eq("pcx_ict")]
+        cisd = group[group["eval_setup"].eq("pcx_ict_cisd")]
+        ict_delta = _rate(ict["delta_kept_vs_base"]) if len(ict) else np.nan
+        cisd_delta = _rate(cisd["delta_kept_vs_base"]) if len(cisd) else np.nan
+        ict_removed = int(ict["removed_n"].sum()) if len(ict) else 0
+        cisd_removed = int(cisd["removed_n"].sum()) if len(cisd) else 0
+        low_removed_penalty = 0.05 * int(ict_removed < min_removed_n) + 0.05 * int(cisd_removed < min_removed_n)
+        selection_score = np.nanmean([ict_delta, cisd_delta]) - low_removed_penalty
+        row.update({
+            "pcx_ict_delta": ict_delta,
+            "pcx_ict_removed_n": ict_removed,
+            "pcx_ict_cisd_delta": cisd_delta,
+            "pcx_ict_cisd_removed_n": cisd_removed,
+            "low_removed_penalty": low_removed_penalty,
+            "selection_score": selection_score,
+        })
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("selection_score", ascending=False).reset_index(drop=True)
+
+
 def build_yearly_by_slice(
     scores: pd.DataFrame,
     slice_membership: pd.DataFrame,
@@ -737,6 +871,7 @@ def run_setup_failure_research(
     model_names: list[str] | None = None,
     init_window: int = 200,
     n_splits: int = 3,
+    threshold_fractions: list[float] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     targets = targets or ["inside_failure", "failure_any"]
     model_names = model_names or ["logistic", "hgb"]
@@ -757,6 +892,7 @@ def run_setup_failure_research(
                     model_name=model_name,
                     init_window=init_window,
                     n_splits=n_splits,
+                    threshold_fractions=threshold_fractions,
                 )
             except RuntimeError as exc:
                 if _should_skip_model_error(model_name, exc):
@@ -784,6 +920,7 @@ def run_pcx_failure_mode_research(
     model_names: list[str] | None = None,
     init_window: int = 200,
     n_splits: int = 3,
+    threshold_fractions: list[float] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     eval_setups = eval_setups or ["pcx_wick", "pcx_ict", "pcx_ict_cisd"]
     targets = targets or ["failure_any", "inside_failure"]
@@ -808,6 +945,7 @@ def run_pcx_failure_mode_research(
                     model_name=model_name,
                     init_window=init_window,
                     n_splits=n_splits,
+                    threshold_fractions=threshold_fractions,
                 )
             except RuntimeError as exc:
                 if _should_skip_model_error(model_name, exc):
@@ -837,6 +975,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--setup", default="pcx_ict", choices=["pcx_wick", "pcx_ict", "pcx_ict_cisd"])
     parser.add_argument("--targets", default="inside_failure,failure_any")
     parser.add_argument("--models", default="logistic,hgb")
+    parser.add_argument("--thresholds", default="")
     parser.add_argument("--init-window", type=int, default=200)
     parser.add_argument("--splits", type=int, default=3)
     parser.add_argument("--summary-output", type=Path, default=SUMMARY_PATH)
@@ -852,6 +991,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pcx-failure-scores-output", type=Path, default=PCX_FAILURE_SCORES_PATH)
     parser.add_argument("--pcx-failure-slice-output", type=Path, default=PCX_FAILURE_SLICE_PATH)
     parser.add_argument("--pcx-failure-yearly-by-slice-output", type=Path, default=PCX_FAILURE_YEARLY_BY_SLICE_PATH)
+    parser.add_argument("--pcx-failure-side-slice-output", type=Path, default=PCX_FAILURE_SIDE_SLICE_PATH)
+    parser.add_argument("--pcx-failure-selection-output", type=Path, default=PCX_FAILURE_SELECTION_PATH)
     parser.add_argument("--yearly-output", type=Path, default=YEARLY_PATH)
     parser.add_argument("--comparison-output", type=Path, default=COMPARISON_PATH)
     parser.add_argument("--permutation-output", type=Path, default=PERMUTATION_PATH)
@@ -879,6 +1020,7 @@ def main() -> None:
     args = parse_args()
     if args.pcx_failure_mode:
         eval_setups = [x.strip() for x in args.eval_setups.split(",") if x.strip()]
+        threshold_fractions = parse_thresholds(args.thresholds) or [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
         summary, scores, slice_eval = run_pcx_failure_mode_research(
             feature_path=args.feature_path,
             signal_path=args.signal_path,
@@ -889,6 +1031,7 @@ def main() -> None:
             model_names=[x.strip() for x in args.models.split(",") if x.strip()],
             init_window=args.init_window,
             n_splits=args.splits,
+            threshold_fractions=threshold_fractions,
         )
         daily = pd.read_parquet(args.feature_path)
         signals = pd.read_csv(args.signal_path, parse_dates=["date", "signal_date"])
@@ -899,19 +1042,31 @@ def main() -> None:
             markovian_root=args.markovian_root,
         )
         yearly_by_slice = build_yearly_by_slice(scores, membership, filter_col=FROZEN_FILTER)
+        side_frames = [
+            build_side_slice_eval(scores, membership, filter_col=flag)
+            for flag in [c for c in scores.columns if c.startswith("remove_top_")]
+        ]
+        side_slice_eval = pd.concat(side_frames, ignore_index=True) if side_frames else pd.DataFrame()
+        selection = build_selection_report(slice_eval)
         args.pcx_failure_summary_output.parent.mkdir(parents=True, exist_ok=True)
         args.pcx_failure_scores_output.parent.mkdir(parents=True, exist_ok=True)
         args.pcx_failure_slice_output.parent.mkdir(parents=True, exist_ok=True)
         args.pcx_failure_yearly_by_slice_output.parent.mkdir(parents=True, exist_ok=True)
+        args.pcx_failure_side_slice_output.parent.mkdir(parents=True, exist_ok=True)
+        args.pcx_failure_selection_output.parent.mkdir(parents=True, exist_ok=True)
         summary.to_csv(args.pcx_failure_summary_output, index=False)
         scores.to_parquet(args.pcx_failure_scores_output, index=False)
         slice_eval.to_csv(args.pcx_failure_slice_output, index=False)
         yearly_by_slice.to_csv(args.pcx_failure_yearly_by_slice_output, index=False)
+        side_slice_eval.to_csv(args.pcx_failure_side_slice_output, index=False)
+        selection.to_csv(args.pcx_failure_selection_output, index=False)
         print(summary.to_string(index=False))
         print(f"Wrote PCX failure summary -> {args.pcx_failure_summary_output}")
         print(f"Wrote PCX failure scores -> {args.pcx_failure_scores_output}")
         print(f"Wrote PCX failure slice eval -> {args.pcx_failure_slice_output}")
         print(f"Wrote PCX failure yearly by slice -> {args.pcx_failure_yearly_by_slice_output}")
+        print(f"Wrote PCX failure side slice eval -> {args.pcx_failure_side_slice_output}")
+        print(f"Wrote PCX failure selection -> {args.pcx_failure_selection_output}")
         return
     setup = args.train_setup or args.setup
     summary, scores = run_setup_failure_research(
@@ -923,6 +1078,7 @@ def main() -> None:
         model_names=[x.strip() for x in args.models.split(",") if x.strip()],
         init_window=args.init_window,
         n_splits=args.splits,
+        threshold_fractions=parse_thresholds(args.thresholds),
     )
     args.summary_output.parent.mkdir(parents=True, exist_ok=True)
     args.scores_output.parent.mkdir(parents=True, exist_ok=True)
