@@ -223,10 +223,10 @@ def enrich_signal_context(
     if "cisd_direction" not in signals.columns:
         cisd = _cisd_direction(daily).rename("cisd_direction_raw")
         cisd_frame = pd.DataFrame({
-            "trade_date": daily["trade_date"],
-            "cisd_direction": cisd.shift(1).to_numpy(),
+            "signal_date": daily["trade_date"],
+            "cisd_direction": cisd.to_numpy(),
         })
-        signals = signals.merge(cisd_frame, on="trade_date", how="left")
+        signals = signals.merge(cisd_frame, on="signal_date", how="left")
 
     return signals
 

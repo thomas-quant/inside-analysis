@@ -394,3 +394,61 @@ def test_parse_args_accepts_pcx_failure_mode_flags(monkeypatch):
     assert args.pcx_failure_scores_output == Path("output/pcx_failure_mode_scores.parquet")
     assert args.pcx_failure_slice_output == Path("output/pcx_failure_mode_slice_eval.csv")
     assert args.pcx_failure_yearly_by_slice_output == Path("output/pcx_failure_mode_yearly_by_slice.csv")
+
+
+def test_research_setup_failures_uses_safe_inputs_only():
+    import ast
+    from pathlib import Path
+
+    source = Path("research_setup_failures.py").read_text()
+    tree = ast.parse(source)
+    allowed_reader_args = {
+        "summary_path",
+        "feature_path",
+        "signal_path",
+        "args.feature_path",
+        "args.signal_path",
+    }
+
+    assert "Does not read raw 1-minute data" in source
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr in {"glob", "rglob"}:
+            raise AssertionError("research_setup_failures.py must not discover raw input files")
+        if node.func.attr not in {"read_csv", "read_parquet"}:
+            continue
+        arg_source = ast.get_source_segment(source, node.args[0]) if node.args else ""
+        if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+            raise AssertionError(f"reader uses literal path: {node.args[0].value}")
+        assert arg_source in allowed_reader_args
+
+
+def test_build_setup_frame_computes_missing_cisd_direction_from_signal_date(monkeypatch):
+    import research_setup_failures
+    from research_setup_failures import build_setup_frame
+
+    daily = _daily_features(10)
+    signals = _signals(1).drop(columns=["cisd_direction"])
+    target_date = pd.Timestamp(signals.loc[0, "date"])
+    signal_date = pd.Timestamp(signals.loc[0, "signal_date"])
+    earlier_signal_date = signal_date - pd.Timedelta(days=1)
+    signals.loc[0, "signal_date"] = earlier_signal_date
+
+    daily.loc[daily["trade_date"].eq(target_date), "inside"] = True
+    daily.loc[daily["trade_date"].eq(earlier_signal_date), "Close"] = 999
+    daily.loc[daily["trade_date"].eq(signal_date), "Close"] = 555
+    daily.loc[daily["trade_date"].eq(target_date), "Close"] = 111
+
+    def fake_cisd(daily_features):
+        values = pd.Series(-1, index=daily_features.index)
+        values.loc[daily_features["trade_date"].eq(earlier_signal_date)] = 1
+        values.loc[daily_features["trade_date"].eq(signal_date)] = -1
+        values.loc[daily_features["trade_date"].eq(target_date)] = -1
+        return values
+
+    monkeypatch.setattr(research_setup_failures, "_cisd_direction", fake_cisd)
+
+    frame, _ = build_setup_frame(daily, signals, setup="pcx_ict_cisd")
+
+    assert target_date in set(frame["trade_date"])
