@@ -46,6 +46,9 @@ PCX_FAILURE_SLICE_PATH = Path("output/pcx_failure_mode_slice_eval.csv")
 PCX_FAILURE_YEARLY_BY_SLICE_PATH = Path("output/pcx_failure_mode_yearly_by_slice.csv")
 PCX_FAILURE_SIDE_SLICE_PATH = Path("output/pcx_failure_mode_side_slice_eval.csv")
 PCX_FAILURE_SELECTION_PATH = Path("output/pcx_failure_mode_selection.csv")
+PCX_FAILURE_SHIP_CONFIG_PATH = Path("output/pcx_failure_mode_ship_config.csv")
+PCX_FAILURE_SKIP_LIST_PATH = Path("output/pcx_failure_mode_skip_list.csv")
+PCX_FAILURE_HOLDOUT_PATH = Path("output/pcx_failure_mode_holdout.csv")
 
 FROZEN_SETUP = "pcx_ict"
 FROZEN_TARGET = "inside_failure"
@@ -790,6 +793,66 @@ def build_selection_report(slice_eval: pd.DataFrame, min_removed_n: int = 20) ->
     return pd.DataFrame(rows).sort_values("selection_score", ascending=False).reset_index(drop=True)
 
 
+def select_ship_config(selection: pd.DataFrame) -> pd.DataFrame:
+    if selection.empty:
+        return pd.DataFrame()
+    out = selection.sort_values("selection_score", ascending=False).head(1).copy()
+    out["selected_for_ship"] = True
+    return out.reset_index(drop=True)
+
+
+def build_ship_skip_list(scores: pd.DataFrame, ship_config: pd.DataFrame) -> pd.DataFrame:
+    if scores.empty or ship_config.empty:
+        return pd.DataFrame()
+    cfg = ship_config.iloc[0]
+    target = cfg["target"]
+    model = cfg["candidate_model"]
+    filter_col = cfg["filter"]
+    selected = scores[
+        scores["target"].eq(target)
+        & scores["candidate_model"].eq(model)
+        & scores[filter_col].astype(bool)
+    ].copy()
+    if selected.empty:
+        return pd.DataFrame()
+    selected["action"] = "skip"
+    selected["ship_target"] = target
+    selected["ship_model"] = model
+    selected["ship_filter"] = filter_col
+    cols = [
+        "trade_date",
+        "direction",
+        "action",
+        "score",
+        "hit",
+        "ship_target",
+        "ship_model",
+        "ship_filter",
+    ]
+    return selected[[c for c in cols if c in selected.columns]].sort_values("trade_date").reset_index(drop=True)
+
+
+def evaluate_ship_holdout(
+    slice_eval: pd.DataFrame,
+    ship_config: pd.DataFrame,
+    min_removed_n: int = 20,
+    min_delta: float = 0.0,
+) -> pd.DataFrame:
+    if slice_eval.empty or ship_config.empty:
+        return pd.DataFrame()
+    cfg = ship_config.iloc[0]
+    out = slice_eval[
+        slice_eval["target"].eq(cfg["target"])
+        & slice_eval["candidate_model"].eq(cfg["candidate_model"])
+        & slice_eval["filter"].eq(cfg["filter"])
+        & slice_eval["eval_setup"].isin(["pcx_ict", "pcx_ict_cisd"])
+    ].copy()
+    if out.empty:
+        return out
+    out["holdout_pass"] = (out["removed_n"] >= min_removed_n) & (out["delta_kept_vs_base"] > min_delta)
+    return out.reset_index(drop=True)
+
+
 def build_yearly_by_slice(
     scores: pd.DataFrame,
     slice_membership: pd.DataFrame,
@@ -993,6 +1056,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pcx-failure-yearly-by-slice-output", type=Path, default=PCX_FAILURE_YEARLY_BY_SLICE_PATH)
     parser.add_argument("--pcx-failure-side-slice-output", type=Path, default=PCX_FAILURE_SIDE_SLICE_PATH)
     parser.add_argument("--pcx-failure-selection-output", type=Path, default=PCX_FAILURE_SELECTION_PATH)
+    parser.add_argument("--pcx-failure-ship-config-output", type=Path, default=PCX_FAILURE_SHIP_CONFIG_PATH)
+    parser.add_argument("--pcx-failure-skip-list-output", type=Path, default=PCX_FAILURE_SKIP_LIST_PATH)
+    parser.add_argument("--pcx-failure-holdout-output", type=Path, default=PCX_FAILURE_HOLDOUT_PATH)
     parser.add_argument("--yearly-output", type=Path, default=YEARLY_PATH)
     parser.add_argument("--comparison-output", type=Path, default=COMPARISON_PATH)
     parser.add_argument("--permutation-output", type=Path, default=PERMUTATION_PATH)
@@ -1048,18 +1114,27 @@ def main() -> None:
         ]
         side_slice_eval = pd.concat(side_frames, ignore_index=True) if side_frames else pd.DataFrame()
         selection = build_selection_report(slice_eval)
+        ship_config = select_ship_config(selection)
+        skip_list = build_ship_skip_list(scores, ship_config)
+        holdout = evaluate_ship_holdout(slice_eval, ship_config)
         args.pcx_failure_summary_output.parent.mkdir(parents=True, exist_ok=True)
         args.pcx_failure_scores_output.parent.mkdir(parents=True, exist_ok=True)
         args.pcx_failure_slice_output.parent.mkdir(parents=True, exist_ok=True)
         args.pcx_failure_yearly_by_slice_output.parent.mkdir(parents=True, exist_ok=True)
         args.pcx_failure_side_slice_output.parent.mkdir(parents=True, exist_ok=True)
         args.pcx_failure_selection_output.parent.mkdir(parents=True, exist_ok=True)
+        args.pcx_failure_ship_config_output.parent.mkdir(parents=True, exist_ok=True)
+        args.pcx_failure_skip_list_output.parent.mkdir(parents=True, exist_ok=True)
+        args.pcx_failure_holdout_output.parent.mkdir(parents=True, exist_ok=True)
         summary.to_csv(args.pcx_failure_summary_output, index=False)
         scores.to_parquet(args.pcx_failure_scores_output, index=False)
         slice_eval.to_csv(args.pcx_failure_slice_output, index=False)
         yearly_by_slice.to_csv(args.pcx_failure_yearly_by_slice_output, index=False)
         side_slice_eval.to_csv(args.pcx_failure_side_slice_output, index=False)
         selection.to_csv(args.pcx_failure_selection_output, index=False)
+        ship_config.to_csv(args.pcx_failure_ship_config_output, index=False)
+        skip_list.to_csv(args.pcx_failure_skip_list_output, index=False)
+        holdout.to_csv(args.pcx_failure_holdout_output, index=False)
         print(summary.to_string(index=False))
         print(f"Wrote PCX failure summary -> {args.pcx_failure_summary_output}")
         print(f"Wrote PCX failure scores -> {args.pcx_failure_scores_output}")
@@ -1067,6 +1142,9 @@ def main() -> None:
         print(f"Wrote PCX failure yearly by slice -> {args.pcx_failure_yearly_by_slice_output}")
         print(f"Wrote PCX failure side slice eval -> {args.pcx_failure_side_slice_output}")
         print(f"Wrote PCX failure selection -> {args.pcx_failure_selection_output}")
+        print(f"Wrote PCX failure ship config -> {args.pcx_failure_ship_config_output}")
+        print(f"Wrote PCX failure skip list -> {args.pcx_failure_skip_list_output}")
+        print(f"Wrote PCX failure holdout -> {args.pcx_failure_holdout_output}")
         return
     setup = args.train_setup or args.setup
     summary, scores = run_setup_failure_research(
