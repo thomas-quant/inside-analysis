@@ -49,6 +49,8 @@ PCX_FAILURE_SELECTION_PATH = Path("output/pcx_failure_mode_selection.csv")
 PCX_FAILURE_SHIP_CONFIG_PATH = Path("output/pcx_failure_mode_ship_config.csv")
 PCX_FAILURE_SKIP_LIST_PATH = Path("output/pcx_failure_mode_skip_list.csv")
 PCX_FAILURE_HOLDOUT_PATH = Path("output/pcx_failure_mode_holdout.csv")
+PCX_FAILURE_FIXED_HOLDOUT_PATH = Path("output/pcx_failure_mode_fixed_holdout.csv")
+PCX_FAILURE_SHIP_PERMUTATION_PATH = Path("output/pcx_failure_mode_ship_permutation.csv")
 
 FROZEN_SETUP = "pcx_ict"
 FROZEN_TARGET = "inside_failure"
@@ -473,6 +475,46 @@ def blocked_setup_failure_scores(
     return pd.DataFrame(records)
 
 
+def fixed_holdout_setup_failure_scores(
+    frame: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    model_name: str,
+    holdout_start: str | pd.Timestamp,
+    threshold_fractions: list[float] | None = None,
+) -> pd.DataFrame:
+    threshold_fractions = threshold_fractions or [0.30]
+    holdout_start = pd.Timestamp(holdout_start)
+    cols = ["trade_date", "direction", "hit", target_col] + feature_cols
+    sub = frame[cols].dropna().sort_values("trade_date").reset_index(drop=True)
+    sub["trade_date"] = _normalize_dates(sub["trade_date"]).to_numpy()
+    train = sub[sub["trade_date"] < holdout_start]
+    test = sub[sub["trade_date"] >= holdout_start]
+    if train.empty or test.empty:
+        return pd.DataFrame()
+    scaler = StandardScaler().fit(train[feature_cols].to_numpy(dtype=float))
+    X_train = scaler.transform(train[feature_cols].to_numpy(dtype=float))
+    X_test = scaler.transform(test[feature_cols].to_numpy(dtype=float))
+    y_train = train[target_col].to_numpy(dtype=bool)
+    train_scores, test_scores = _fit_scores(model_name, X_train, y_train, X_test)
+    thresholds = _thresholds_from_train_scores(train_scores, threshold_fractions)
+    records = []
+    for i, (_, row) in enumerate(test.iterrows()):
+        rec = {
+            "trade_date": row["trade_date"],
+            "direction": row["direction"],
+            "hit": bool(row["hit"]),
+            "target": target_col,
+            "true_failure": bool(row[target_col]),
+            "score": float(test_scores[i]),
+            "block_id": "fixed_holdout",
+        }
+        for flag, threshold in thresholds.items():
+            rec[flag] = bool(test_scores[i] >= threshold)
+        records.append(rec)
+    return pd.DataFrame(records)
+
+
 def _blocked_setup_failure_scores_with_permuted_train(
     frame: pd.DataFrame,
     feature_cols: list[str],
@@ -853,6 +895,18 @@ def evaluate_ship_holdout(
     return out.reset_index(drop=True)
 
 
+def build_ship_permutation_summary(real_holdout: pd.DataFrame, permutation: pd.DataFrame) -> pd.DataFrame:
+    if real_holdout.empty:
+        return pd.DataFrame()
+    real_score = float(real_holdout["delta_kept_vs_base"].mean())
+    p_perm = float((permutation["selection_score"] >= real_score).mean()) if len(permutation) else np.nan
+    return pd.DataFrame([{
+        "real_selection_score": real_score,
+        "permutation_runs": len(permutation),
+        "p_perm": p_perm,
+    }])
+
+
 def build_yearly_by_slice(
     scores: pd.DataFrame,
     slice_membership: pd.DataFrame,
@@ -1059,6 +1113,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pcx-failure-ship-config-output", type=Path, default=PCX_FAILURE_SHIP_CONFIG_PATH)
     parser.add_argument("--pcx-failure-skip-list-output", type=Path, default=PCX_FAILURE_SKIP_LIST_PATH)
     parser.add_argument("--pcx-failure-holdout-output", type=Path, default=PCX_FAILURE_HOLDOUT_PATH)
+    parser.add_argument("--pcx-failure-fixed-holdout-output", type=Path, default=PCX_FAILURE_FIXED_HOLDOUT_PATH)
+    parser.add_argument("--holdout-start", default="2022-01-01")
     parser.add_argument("--yearly-output", type=Path, default=YEARLY_PATH)
     parser.add_argument("--comparison-output", type=Path, default=COMPARISON_PATH)
     parser.add_argument("--permutation-output", type=Path, default=PERMUTATION_PATH)
@@ -1117,6 +1173,34 @@ def main() -> None:
         ship_config = select_ship_config(selection)
         skip_list = build_ship_skip_list(scores, ship_config)
         holdout = evaluate_ship_holdout(slice_eval, ship_config)
+        fixed_holdout = pd.DataFrame()
+        if not ship_config.empty:
+            cfg = ship_config.iloc[0]
+            daily_for_holdout = daily
+            signals_for_holdout = signals
+            frame_for_holdout, _ = build_setup_frame(
+                daily_for_holdout,
+                signals_for_holdout,
+                setup=args.train_setup or "pcx_wick",
+                markovian_root=args.markovian_root,
+            )
+            holdout_feature_cols = _usable_feature_columns(frame_for_holdout, failure_mode_feature_columns(frame_for_holdout))
+            fixed_scores = fixed_holdout_setup_failure_scores(
+                frame_for_holdout,
+                holdout_feature_cols,
+                target_col=str(cfg["target"]),
+                model_name=str(cfg["candidate_model"]),
+                holdout_start=args.holdout_start,
+                threshold_fractions=parse_thresholds(args.thresholds) or [0.30],
+            )
+            if not fixed_scores.empty:
+                fixed_scores["setup"] = args.train_setup or "pcx_wick"
+                fixed_scores["candidate_model"] = str(cfg["candidate_model"])
+                fixed_slice_frames = [
+                    build_slice_eval(fixed_scores, membership, filter_col=flag)
+                    for flag in [c for c in fixed_scores.columns if c.startswith("remove_top_")]
+                ]
+                fixed_holdout = pd.concat(fixed_slice_frames, ignore_index=True) if fixed_slice_frames else pd.DataFrame()
         args.pcx_failure_summary_output.parent.mkdir(parents=True, exist_ok=True)
         args.pcx_failure_scores_output.parent.mkdir(parents=True, exist_ok=True)
         args.pcx_failure_slice_output.parent.mkdir(parents=True, exist_ok=True)
@@ -1126,6 +1210,7 @@ def main() -> None:
         args.pcx_failure_ship_config_output.parent.mkdir(parents=True, exist_ok=True)
         args.pcx_failure_skip_list_output.parent.mkdir(parents=True, exist_ok=True)
         args.pcx_failure_holdout_output.parent.mkdir(parents=True, exist_ok=True)
+        args.pcx_failure_fixed_holdout_output.parent.mkdir(parents=True, exist_ok=True)
         summary.to_csv(args.pcx_failure_summary_output, index=False)
         scores.to_parquet(args.pcx_failure_scores_output, index=False)
         slice_eval.to_csv(args.pcx_failure_slice_output, index=False)
@@ -1135,6 +1220,7 @@ def main() -> None:
         ship_config.to_csv(args.pcx_failure_ship_config_output, index=False)
         skip_list.to_csv(args.pcx_failure_skip_list_output, index=False)
         holdout.to_csv(args.pcx_failure_holdout_output, index=False)
+        fixed_holdout.to_csv(args.pcx_failure_fixed_holdout_output, index=False)
         print(summary.to_string(index=False))
         print(f"Wrote PCX failure summary -> {args.pcx_failure_summary_output}")
         print(f"Wrote PCX failure scores -> {args.pcx_failure_scores_output}")
@@ -1145,6 +1231,7 @@ def main() -> None:
         print(f"Wrote PCX failure ship config -> {args.pcx_failure_ship_config_output}")
         print(f"Wrote PCX failure skip list -> {args.pcx_failure_skip_list_output}")
         print(f"Wrote PCX failure holdout -> {args.pcx_failure_holdout_output}")
+        print(f"Wrote PCX failure fixed holdout -> {args.pcx_failure_fixed_holdout_output}")
         return
     setup = args.train_setup or args.setup
     summary, scores = run_setup_failure_research(

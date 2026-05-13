@@ -409,6 +409,51 @@ def test_evaluate_ship_holdout_reports_recent_slice_metrics():
     assert (out["holdout_pass"] == True).all()
 
 
+def test_fixed_holdout_scores_train_before_start_and_score_after():
+    from research_setup_failures import fixed_holdout_setup_failure_scores
+
+    frame = pd.DataFrame({
+        "trade_date": pd.date_range("2020-01-01", periods=80),
+        "direction": ["LONG"] * 80,
+        "hit": [i % 4 != 0 for i in range(80)],
+        "failure_any": [i % 4 == 0 for i in range(80)],
+        "x": np.linspace(0, 1, 80),
+    })
+
+    scores = fixed_holdout_setup_failure_scores(
+        frame,
+        feature_cols=["x"],
+        target_col="failure_any",
+        model_name="logistic",
+        holdout_start="2020-02-20",
+        threshold_fractions=[0.30],
+    )
+
+    assert not scores.empty
+    assert scores["trade_date"].min() >= pd.Timestamp("2020-02-20")
+    assert "remove_top_30" in scores.columns
+
+
+def test_build_ship_permutation_summary_reports_p_value():
+    from research_setup_failures import build_ship_permutation_summary
+
+    real = pd.DataFrame({
+        "eval_setup": ["pcx_ict", "pcx_ict_cisd"],
+        "delta_kept_vs_base": [0.08, 0.10],
+        "removed_n": [30, 25],
+    })
+    null = pd.DataFrame({
+        "run": [0, 1, 2],
+        "selection_score": [0.01, 0.09, 0.03],
+    })
+
+    out = build_ship_permutation_summary(real, null)
+
+    assert out.iloc[0]["permutation_runs"] == 3
+    assert out.iloc[0]["real_selection_score"] == 0.09
+    assert out.iloc[0]["p_perm"] == 1 / 3
+
+
 def test_summarize_setup_filter_reports_kept_removed_trade_value():
     from research_setup_failures import summarize_setup_filter
 
