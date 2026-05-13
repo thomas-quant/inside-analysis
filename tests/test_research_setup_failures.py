@@ -148,6 +148,91 @@ def test_blocked_setup_failure_scores_does_not_remove_all_when_train_labels_dege
     assert scores["remove_top_20"].sum() == 0
 
 
+def test_xgb_gpu_params_use_cuda_device_api_and_depth_variants():
+    from research_setup_failures import xgb_gpu_params
+
+    params = xgb_gpu_params(scale_pos_weight=2.0, model_name="xgb_gpu_depth2")
+
+    assert params["device"] == "cuda"
+    assert params["tree_method"] == "hist"
+    assert params["max_depth"] == 2
+    assert params["scale_pos_weight"] == 2.0
+    assert "gpu_id" not in params
+    assert "predictor" not in params
+
+
+def test_fit_scores_routes_xgb_gpu_depth_variant_to_xgboost(monkeypatch):
+    import sys
+    import types
+    import research_setup_failures
+
+    captured = {}
+
+    class FakeXGBClassifier:
+        def __init__(self, **params):
+            captured.update(params)
+
+        def fit(self, X, y):
+            return self
+
+        def predict_proba(self, X):
+            p = np.linspace(0.2, 0.8, len(X))
+            return np.column_stack([1.0 - p, p])
+
+    fake_module = types.SimpleNamespace(XGBClassifier=FakeXGBClassifier)
+    monkeypatch.setitem(sys.modules, "xgboost", fake_module)
+
+    X_train = np.arange(40, dtype=float).reshape(20, 2)
+    y_train = np.array([False, True] * 10)
+    X_test = np.arange(8, dtype=float).reshape(4, 2)
+
+    train_scores, test_scores = research_setup_failures._fit_scores(
+        "xgb_gpu_depth4", X_train, y_train, X_test
+    )
+
+    assert captured["device"] == "cuda"
+    assert captured["max_depth"] == 4
+    assert len(train_scores) == len(X_train)
+    assert len(test_scores) == len(X_test)
+
+
+def test_run_setup_failure_research_skips_unavailable_xgb_gpu(monkeypatch, tmp_path):
+    import research_setup_failures
+    from research_setup_failures import run_pcx_failure_mode_research
+
+    daily = _daily_features(80)
+    signals = _signals(70)
+    feature_path = tmp_path / "features.parquet"
+    signal_path = tmp_path / "signals.csv"
+    daily.to_parquet(feature_path, index=False)
+    signals.to_csv(signal_path, index=False)
+
+    original = research_setup_failures._fit_scores
+
+    def fake_fit(model_name, X_train, y_train, X_test):
+        if model_name.startswith("xgb_gpu"):
+            raise RuntimeError("xgboost cuda unavailable")
+        return original(model_name, X_train, y_train, X_test)
+
+    monkeypatch.setattr(research_setup_failures, "_fit_scores", fake_fit)
+
+    summary, scores, slice_eval = run_pcx_failure_mode_research(
+        feature_path=feature_path,
+        signal_path=signal_path,
+        markovian_root=None,
+        train_setup="pcx_wick",
+        eval_setups=["pcx_wick"],
+        targets=["failure_any"],
+        model_names=["logistic", "xgb_gpu_depth2"],
+        init_window=30,
+        n_splits=2,
+    )
+
+    assert set(summary["candidate_model"]) == {"logistic"}
+    assert set(scores["candidate_model"]) == {"logistic"}
+    assert set(slice_eval["candidate_model"].dropna()) == {"logistic"}
+
+
 def test_summarize_setup_filter_reports_kept_removed_trade_value():
     from research_setup_failures import summarize_setup_filter
 
