@@ -686,6 +686,55 @@ def run_setup_failure_research(
     return summary, all_scores
 
 
+def run_pcx_failure_mode_research(
+    feature_path: Path = DEFAULT_FEATURE_PATH,
+    signal_path: Path = DEFAULT_SIGNAL_PATH,
+    markovian_root: Path | None = DEFAULT_MARKOVIAN_ROOT,
+    train_setup: str = "pcx_wick",
+    eval_setups: list[str] | None = None,
+    targets: list[str] | None = None,
+    model_names: list[str] | None = None,
+    init_window: int = 200,
+    n_splits: int = 3,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    eval_setups = eval_setups or ["pcx_wick", "pcx_ict", "pcx_ict_cisd"]
+    targets = targets or ["failure_any", "inside_failure"]
+    model_names = model_names or ["logistic", "hgb"]
+
+    daily = pd.read_parquet(feature_path)
+    signals = pd.read_csv(signal_path, parse_dates=["date", "signal_date"])
+    frame, _ = build_setup_frame(daily, signals, setup=train_setup, markovian_root=markovian_root)
+    feature_cols = _usable_feature_columns(frame, failure_mode_feature_columns(frame))
+    membership = build_slice_membership(daily, signals, setups=eval_setups, markovian_root=markovian_root)
+
+    summaries = []
+    score_frames = []
+    slice_frames = []
+    for target in targets:
+        for model_name in model_names:
+            scores = blocked_setup_failure_scores(
+                frame,
+                feature_cols,
+                target_col=target,
+                model_name=model_name,
+                init_window=init_window,
+                n_splits=n_splits,
+            )
+            if scores.empty:
+                continue
+            scores["setup"] = train_setup
+            scores["candidate_model"] = model_name
+            score_frames.append(scores)
+            summaries.append(summarize_setup_filter(scores, setup=train_setup, target=target, model_name=model_name))
+            for flag in [c for c in scores.columns if c.startswith("remove_top_")]:
+                slice_frames.append(build_slice_eval(scores, membership, filter_col=flag))
+
+    summary = pd.concat(summaries, ignore_index=True) if summaries else pd.DataFrame()
+    all_scores = pd.concat(score_frames, ignore_index=True) if score_frames else pd.DataFrame()
+    slice_eval = pd.concat(slice_frames, ignore_index=True) if slice_frames else pd.DataFrame()
+    return summary, all_scores, slice_eval
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Setup-conditioned failure model research")
     parser.add_argument("--feature-path", type=Path, default=DEFAULT_FEATURE_PATH)

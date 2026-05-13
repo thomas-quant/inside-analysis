@@ -338,3 +338,37 @@ def test_build_slice_eval_preserves_target_model_filter_and_train_setup():
     assert row["candidate_model"] == "hgb"
     assert row["filter"] == "remove_top_20"
     assert row["base_n"] == 2
+
+
+def test_run_pcx_failure_mode_research_trains_wick_and_evaluates_slices(tmp_path):
+    from research_setup_failures import run_pcx_failure_mode_research
+
+    daily = _daily_features(140)
+    signals = _signals(130)
+    for i in signals.index:
+        signals.loc[i, "wick_filtered"] = True
+        signals.loc[i, "ict_bias"] = 1 if signals.loc[i, "direction"] == "LONG" else -1
+        signals.loc[i, "cisd_direction"] = signals.loc[i, "ict_bias"] if i % 3 != 0 else -signals.loc[i, "ict_bias"]
+
+    feature_path = tmp_path / "features.parquet"
+    signal_path = tmp_path / "signals.csv"
+    daily.to_parquet(feature_path, index=False)
+    signals.to_csv(signal_path, index=False)
+
+    summary, scores, slice_eval = run_pcx_failure_mode_research(
+        feature_path=feature_path,
+        signal_path=signal_path,
+        markovian_root=None,
+        train_setup="pcx_wick",
+        eval_setups=["pcx_wick", "pcx_ict", "pcx_ict_cisd"],
+        targets=["failure_any"],
+        model_names=["logistic"],
+        init_window=40,
+        n_splits=3,
+    )
+
+    assert not summary.empty
+    assert not scores.empty
+    assert set(slice_eval["eval_setup"]) == {"pcx_wick", "pcx_ict", "pcx_ict_cisd"}
+    assert set(slice_eval["train_setup"]) == {"pcx_wick"}
+    assert set(slice_eval["target"].dropna()) == {"failure_any"}
