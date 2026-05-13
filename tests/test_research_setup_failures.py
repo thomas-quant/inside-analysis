@@ -152,6 +152,9 @@ def test_xgb_gpu_params_use_cuda_device_api_and_depth_variants():
     from research_setup_failures import xgb_gpu_params
 
     params = xgb_gpu_params(scale_pos_weight=2.0, model_name="xgb_gpu_depth2")
+    depth1 = xgb_gpu_params(scale_pos_weight=2.0, model_name="xgb_gpu_depth1")
+    l1 = xgb_gpu_params(scale_pos_weight=2.0, model_name="xgb_gpu_depth2_l1")
+    subsample = xgb_gpu_params(scale_pos_weight=2.0, model_name="xgb_gpu_depth2_subsample")
 
     assert params["device"] == "cuda"
     assert params["tree_method"] == "hist"
@@ -159,6 +162,9 @@ def test_xgb_gpu_params_use_cuda_device_api_and_depth_variants():
     assert params["scale_pos_weight"] == 2.0
     assert "gpu_id" not in params
     assert "predictor" not in params
+    assert depth1["max_depth"] == 1
+    assert l1["reg_alpha"] > 0
+    assert subsample["subsample"] < params["subsample"]
 
 
 def test_fit_scores_routes_xgb_gpu_depth_variant_to_xgboost(monkeypatch):
@@ -231,6 +237,108 @@ def test_run_setup_failure_research_skips_unavailable_xgb_gpu(monkeypatch, tmp_p
     assert set(summary["candidate_model"]) == {"logistic"}
     assert set(scores["candidate_model"]) == {"logistic"}
     assert set(slice_eval["candidate_model"].dropna()) == {"logistic"}
+
+
+def test_fit_scores_supports_ensemble_models(monkeypatch):
+    import research_setup_failures
+
+    def fake_fit(model_name, X_train, y_train, X_test):
+        if model_name == "logistic":
+            return np.linspace(0.1, 0.7, len(X_train)), np.linspace(0.2, 0.8, len(X_test))
+        if model_name == "hgb":
+            return np.linspace(0.3, 0.9, len(X_train)), np.linspace(0.4, 0.9, len(X_test))
+        if model_name == "xgb_gpu_depth2":
+            raise RuntimeError("cuda unavailable")
+        raise AssertionError(model_name)
+
+    monkeypatch.setattr(research_setup_failures, "_fit_single_model_scores", fake_fit)
+    X_train = np.arange(40, dtype=float).reshape(20, 2)
+    y_train = np.array([False, True] * 10)
+    X_test = np.arange(8, dtype=float).reshape(4, 2)
+
+    mean_train, mean_test = research_setup_failures._fit_scores("ensemble_mean", X_train, y_train, X_test)
+    rank_train, rank_test = research_setup_failures._fit_scores("ensemble_rank_mean", X_train, y_train, X_test)
+
+    assert len(mean_train) == len(X_train)
+    assert len(mean_test) == len(X_test)
+    assert np.all((rank_train >= 0) & (rank_train <= 1))
+    assert np.all((rank_test >= 0) & (rank_test <= 1))
+
+
+def test_parse_thresholds_and_runner_emit_extra_threshold_flags(tmp_path):
+    from research_setup_failures import parse_thresholds, run_pcx_failure_mode_research
+
+    assert parse_thresholds("0.05,0.15,0.30") == [0.05, 0.15, 0.30]
+
+    daily = _daily_features(80)
+    signals = _signals(70)
+    feature_path = tmp_path / "features.parquet"
+    signal_path = tmp_path / "signals.csv"
+    daily.to_parquet(feature_path, index=False)
+    signals.to_csv(signal_path, index=False)
+
+    summary, scores, slice_eval = run_pcx_failure_mode_research(
+        feature_path=feature_path,
+        signal_path=signal_path,
+        markovian_root=None,
+        train_setup="pcx_wick",
+        eval_setups=["pcx_wick"],
+        targets=["failure_any"],
+        model_names=["logistic"],
+        init_window=30,
+        n_splits=2,
+        threshold_fractions=[0.05, 0.15, 0.30],
+    )
+
+    assert {"remove_top_05", "remove_top_15", "remove_top_30"}.issubset(scores.columns)
+    assert {"remove_top_05", "remove_top_15", "remove_top_30"}.issubset(set(summary["filter"]))
+    assert {"remove_top_05", "remove_top_15", "remove_top_30"}.issubset(set(slice_eval["filter"]))
+
+
+def test_build_side_slice_eval_reports_long_and_short_rows():
+    from research_setup_failures import build_side_slice_eval
+
+    scores = pd.DataFrame({
+        "trade_date": pd.to_datetime([
+            "2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04",
+            "2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04",
+        ]),
+        "direction": ["LONG", "SHORT", "LONG", "SHORT"] * 2,
+        "hit": [True, False, True, True] * 2,
+        "remove_top_20": [False, True, True, False] * 2,
+        "setup": ["pcx_wick"] * 8,
+        "target": ["failure_any"] * 8,
+        "candidate_model": ["logistic"] * 4 + ["hgb"] * 4,
+    })
+    membership = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]),
+        "pcx_wick": [True, True, True, True],
+    })
+
+    out = build_side_slice_eval(scores, membership, filter_col="remove_top_20")
+
+    assert set(out["side"]) == {"LONG", "SHORT"}
+    assert set(out["eval_setup"]) == {"pcx_wick"}
+    assert set(out["candidate_model"]) == {"logistic", "hgb"}
+    assert out[out["side"].eq("LONG")].iloc[0]["base_n"] == 2
+
+
+def test_build_selection_report_ranks_transfer_and_penalizes_small_removed():
+    from research_setup_failures import build_selection_report
+
+    slice_eval = pd.DataFrame({
+        "target": ["failure_any", "failure_any", "failure_any", "failure_any"],
+        "candidate_model": ["a", "a", "b", "b"],
+        "filter": ["remove_top_20"] * 4,
+        "eval_setup": ["pcx_ict", "pcx_ict_cisd", "pcx_ict", "pcx_ict_cisd"],
+        "delta_kept_vs_base": [0.04, 0.03, 0.10, 0.10],
+        "removed_n": [30, 25, 4, 3],
+    })
+
+    out = build_selection_report(slice_eval, min_removed_n=20)
+
+    assert out.iloc[0]["candidate_model"] == "a"
+    assert out.iloc[0]["selection_score"] > out.iloc[1]["selection_score"]
 
 
 def test_summarize_setup_filter_reports_kept_removed_trade_value():
