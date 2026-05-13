@@ -955,3 +955,20 @@ def test_robust_selection_blocks_meaningful_negative_yearly_slice():
     assert bool(row["ship_eligible"]) is False
     assert row["eligibility_reason"] == "yearly_min_delta<0"
     assert row["yearly_penalty"] == 0.04
+
+def test_select_ship_config_can_choose_preferred_eligible_filter():
+    from research_setup_failures import select_ship_config
+
+    selection = pd.DataFrame({
+        "target": ["failure_any", "failure_any"],
+        "candidate_model": ["logistic", "logistic"],
+        "filter": ["remove_top_30", "remove_top_20"],
+        "selection_score": [0.09, 0.086],
+        "ship_eligible": [True, True],
+    })
+
+    out = select_ship_config(selection, preferred_filter="remove_top_20")
+
+    assert len(out) == 1
+    assert out.iloc[0]["filter"] == "remove_top_20"
+    assert bool(out.iloc[0]["selected_for_ship"]) is True
