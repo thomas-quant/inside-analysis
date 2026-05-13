@@ -372,3 +372,25 @@ def test_run_pcx_failure_mode_research_trains_wick_and_evaluates_slices(tmp_path
     assert set(slice_eval["eval_setup"]) == {"pcx_wick", "pcx_ict", "pcx_ict_cisd"}
     assert set(slice_eval["train_setup"]) == {"pcx_wick"}
     assert set(slice_eval["target"].dropna()) == {"failure_any"}
+
+
+def test_parse_args_accepts_pcx_failure_mode_flags(monkeypatch):
+    from pathlib import Path
+    from research_setup_failures import parse_args
+
+    monkeypatch.setattr("sys.argv", [
+        "research_setup_failures.py",
+        "--pcx-failure-mode",
+        "--train-setup", "pcx_wick",
+        "--eval-setups", "pcx_wick,pcx_ict,pcx_ict_cisd",
+    ])
+
+    args = parse_args()
+
+    assert args.pcx_failure_mode is True
+    assert args.train_setup == "pcx_wick"
+    assert args.eval_setups == "pcx_wick,pcx_ict,pcx_ict_cisd"
+    assert args.pcx_failure_summary_output == Path("output/pcx_failure_mode_summary.csv")
+    assert args.pcx_failure_scores_output == Path("output/pcx_failure_mode_scores.parquet")
+    assert args.pcx_failure_slice_output == Path("output/pcx_failure_mode_slice_eval.csv")
+    assert args.pcx_failure_yearly_by_slice_output == Path("output/pcx_failure_mode_yearly_by_slice.csv")

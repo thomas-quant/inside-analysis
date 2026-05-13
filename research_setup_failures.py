@@ -40,6 +40,10 @@ COMPARISON_PATH = Path("output/setup_failure_same_date_comparison.csv")
 PERMUTATION_PATH = Path("output/setup_failure_permutation.csv")
 SLICE_PATH = Path("output/setup_failure_slice_eval.csv")
 FROZEN_PATH = Path("output/setup_failure_frozen_candidate.csv")
+PCX_FAILURE_SUMMARY_PATH = Path("output/pcx_failure_mode_summary.csv")
+PCX_FAILURE_SCORES_PATH = Path("output/pcx_failure_mode_scores.parquet")
+PCX_FAILURE_SLICE_PATH = Path("output/pcx_failure_mode_slice_eval.csv")
+PCX_FAILURE_YEARLY_BY_SLICE_PATH = Path("output/pcx_failure_mode_yearly_by_slice.csv")
 
 FROZEN_SETUP = "pcx_ict"
 FROZEN_TARGET = "inside_failure"
@@ -610,6 +614,42 @@ def build_slice_eval(
     return pd.DataFrame(rows)
 
 
+def build_yearly_by_slice(
+    scores: pd.DataFrame,
+    slice_membership: pd.DataFrame,
+    filter_col: str = FROZEN_FILTER,
+) -> pd.DataFrame:
+    if scores.empty or slice_membership.empty:
+        return pd.DataFrame()
+    scored = scores.copy()
+    membership = slice_membership.copy()
+    scored["trade_date"] = _normalize_dates(scored["trade_date"]).to_numpy()
+    membership["trade_date"] = _normalize_dates(membership["trade_date"]).to_numpy()
+    joined = scored.merge(membership, on="trade_date", how="inner")
+    if joined.empty:
+        return pd.DataFrame()
+    joined["year"] = pd.to_datetime(joined["trade_date"]).dt.year
+    rows = []
+    slice_cols = [c for c in membership.columns if c != "trade_date"]
+    group_cols = [c for c in ["setup", "target", "candidate_model"] if c in joined.columns]
+    for keys, score_group in joined.groupby(group_cols, dropna=False) if group_cols else [((), joined)]:
+        key_values = keys if isinstance(keys, tuple) else (keys,)
+        meta = dict(zip(group_cols, key_values))
+        for slice_col in slice_cols:
+            slice_group = score_group[score_group[slice_col].astype(bool)]
+            for year, year_group in slice_group.groupby("year"):
+                row = _summary_row_for_scores(year_group, filter_col)
+                row["year"] = int(year)
+                row["train_setup"] = meta.get("setup", np.nan)
+                row["eval_setup"] = slice_col
+                if "target" in meta:
+                    row["target"] = meta["target"]
+                if "candidate_model" in meta:
+                    row["candidate_model"] = meta["candidate_model"]
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def permutation_delta_test(
     frame: pd.DataFrame,
     feature_cols: list[str],
@@ -753,6 +793,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--permutation-runs", type=int, default=0)
     parser.add_argument("--train-setup", default=None)
     parser.add_argument("--eval-setups", default="")
+    parser.add_argument("--pcx-failure-mode", action="store_true")
+    parser.add_argument("--pcx-failure-summary-output", type=Path, default=PCX_FAILURE_SUMMARY_PATH)
+    parser.add_argument("--pcx-failure-scores-output", type=Path, default=PCX_FAILURE_SCORES_PATH)
+    parser.add_argument("--pcx-failure-slice-output", type=Path, default=PCX_FAILURE_SLICE_PATH)
+    parser.add_argument("--pcx-failure-yearly-by-slice-output", type=Path, default=PCX_FAILURE_YEARLY_BY_SLICE_PATH)
     parser.add_argument("--yearly-output", type=Path, default=YEARLY_PATH)
     parser.add_argument("--comparison-output", type=Path, default=COMPARISON_PATH)
     parser.add_argument("--permutation-output", type=Path, default=PERMUTATION_PATH)
@@ -778,6 +823,42 @@ def _write_csv(df: pd.DataFrame, path: Path) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.pcx_failure_mode:
+        eval_setups = [x.strip() for x in args.eval_setups.split(",") if x.strip()]
+        summary, scores, slice_eval = run_pcx_failure_mode_research(
+            feature_path=args.feature_path,
+            signal_path=args.signal_path,
+            markovian_root=args.markovian_root,
+            train_setup=args.train_setup or "pcx_wick",
+            eval_setups=eval_setups or ["pcx_wick", "pcx_ict", "pcx_ict_cisd"],
+            targets=[x.strip() for x in args.targets.split(",") if x.strip()],
+            model_names=[x.strip() for x in args.models.split(",") if x.strip()],
+            init_window=args.init_window,
+            n_splits=args.splits,
+        )
+        daily = pd.read_parquet(args.feature_path)
+        signals = pd.read_csv(args.signal_path, parse_dates=["date", "signal_date"])
+        membership = build_slice_membership(
+            daily,
+            signals,
+            setups=eval_setups or ["pcx_wick", "pcx_ict", "pcx_ict_cisd"],
+            markovian_root=args.markovian_root,
+        )
+        yearly_by_slice = build_yearly_by_slice(scores, membership, filter_col=FROZEN_FILTER)
+        args.pcx_failure_summary_output.parent.mkdir(parents=True, exist_ok=True)
+        args.pcx_failure_scores_output.parent.mkdir(parents=True, exist_ok=True)
+        args.pcx_failure_slice_output.parent.mkdir(parents=True, exist_ok=True)
+        args.pcx_failure_yearly_by_slice_output.parent.mkdir(parents=True, exist_ok=True)
+        summary.to_csv(args.pcx_failure_summary_output, index=False)
+        scores.to_parquet(args.pcx_failure_scores_output, index=False)
+        slice_eval.to_csv(args.pcx_failure_slice_output, index=False)
+        yearly_by_slice.to_csv(args.pcx_failure_yearly_by_slice_output, index=False)
+        print(summary.to_string(index=False))
+        print(f"Wrote PCX failure summary -> {args.pcx_failure_summary_output}")
+        print(f"Wrote PCX failure scores -> {args.pcx_failure_scores_output}")
+        print(f"Wrote PCX failure slice eval -> {args.pcx_failure_slice_output}")
+        print(f"Wrote PCX failure yearly by slice -> {args.pcx_failure_yearly_by_slice_output}")
+        return
     setup = args.train_setup or args.setup
     summary, scores = run_setup_failure_research(
         feature_path=args.feature_path,
