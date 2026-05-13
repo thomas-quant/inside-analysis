@@ -910,6 +910,8 @@ def build_robust_selection_report(
     fixed_holdout: pd.DataFrame | None = None,
     permutation: pd.DataFrame | None = None,
     min_removed_n: int = 20,
+    min_yearly_base_n: int = 20,
+    min_yearly_removed_n: int = 3,
 ) -> pd.DataFrame:
     """Rank PCX failure filters by cross-slice lift with stability penalties."""
     if slice_eval.empty:
@@ -932,7 +934,23 @@ def build_robust_selection_report(
 
         yearly = _group_lookup_frame(yearly_by_slice, keys, "delta_kept_vs_base")
         deploy_yearly = yearly[yearly["eval_setup"].isin(["pcx_ict", "pcx_ict_cisd"])] if not yearly.empty and "eval_setup" in yearly else yearly
-        row["yearly_min_delta"] = float(deploy_yearly["delta_kept_vs_base"].min()) if len(deploy_yearly) else np.nan
+        if len(deploy_yearly) and {"base_n", "removed_n"}.issubset(deploy_yearly.columns):
+            warning_mask = (
+                (deploy_yearly["delta_kept_vs_base"] < 0)
+                & (
+                    (deploy_yearly["base_n"] < min_yearly_base_n)
+                    | (deploy_yearly["removed_n"] < min_yearly_removed_n)
+                )
+            )
+            material_yearly = deploy_yearly[
+                (deploy_yearly["base_n"] >= min_yearly_base_n)
+                & (deploy_yearly["removed_n"] >= min_yearly_removed_n)
+            ]
+        else:
+            warning_mask = pd.Series(False, index=deploy_yearly.index)
+            material_yearly = deploy_yearly
+        row["yearly_warning_count"] = int(warning_mask.sum()) if len(deploy_yearly) else 0
+        row["yearly_min_delta"] = float(material_yearly["delta_kept_vs_base"].min()) if len(material_yearly) else np.nan
         row["yearly_penalty"] = abs(min(0.0, row["yearly_min_delta"])) if pd.notna(row["yearly_min_delta"]) else 0.0
 
         holdout = _group_lookup_frame(fixed_holdout, keys, "delta_kept_vs_base")

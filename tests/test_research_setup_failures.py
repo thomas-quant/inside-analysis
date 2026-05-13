@@ -885,3 +885,73 @@ def test_pcx_failure_mode_selection_contains_robust_columns(tmp_path):
     assert not selection.empty
     assert {"ship_eligible", "eligibility_reason", "yearly_penalty", "pcx_ict_delta", "pcx_ict_cisd_delta"}.issubset(selection.columns)
     assert {"logistic", "ensemble_rank_mean"}.issubset(set(selection["candidate_model"]))
+
+def test_robust_selection_warns_but_does_not_block_tiny_negative_yearly_slice():
+    from research_setup_failures import build_robust_selection_report
+
+    slice_eval = pd.DataFrame({
+        "target": ["failure_any", "failure_any"],
+        "candidate_model": ["logistic", "logistic"],
+        "filter": ["remove_top_20", "remove_top_20"],
+        "eval_setup": ["pcx_ict", "pcx_ict_cisd"],
+        "delta_kept_vs_base": [0.07, 0.10],
+        "removed_n": [54, 29],
+    })
+    yearly = pd.DataFrame({
+        "target": ["failure_any", "failure_any", "failure_any"],
+        "candidate_model": ["logistic", "logistic", "logistic"],
+        "filter": ["remove_top_20", "remove_top_20", "remove_top_20"],
+        "eval_setup": ["pcx_ict", "pcx_ict", "pcx_ict_cisd"],
+        "base_n": [12, 30, 9],
+        "removed_n": [1, 5, 1],
+        "delta_kept_vs_base": [-0.02, 0.04, -0.01],
+    })
+
+    out = build_robust_selection_report(
+        slice_eval,
+        yearly_by_slice=yearly,
+        min_removed_n=20,
+        min_yearly_base_n=20,
+        min_yearly_removed_n=3,
+    )
+
+    row = out.iloc[0]
+    assert bool(row["ship_eligible"]) is True
+    assert row["eligibility_reason"] == "eligible"
+    assert row["yearly_warning_count"] == 2
+    assert row["yearly_penalty"] == 0.0
+
+
+def test_robust_selection_blocks_meaningful_negative_yearly_slice():
+    from research_setup_failures import build_robust_selection_report
+
+    slice_eval = pd.DataFrame({
+        "target": ["failure_any", "failure_any"],
+        "candidate_model": ["logistic", "logistic"],
+        "filter": ["remove_top_20", "remove_top_20"],
+        "eval_setup": ["pcx_ict", "pcx_ict_cisd"],
+        "delta_kept_vs_base": [0.07, 0.10],
+        "removed_n": [54, 29],
+    })
+    yearly = pd.DataFrame({
+        "target": ["failure_any"],
+        "candidate_model": ["logistic"],
+        "filter": ["remove_top_20"],
+        "eval_setup": ["pcx_ict"],
+        "base_n": [30],
+        "removed_n": [5],
+        "delta_kept_vs_base": [-0.04],
+    })
+
+    out = build_robust_selection_report(
+        slice_eval,
+        yearly_by_slice=yearly,
+        min_removed_n=20,
+        min_yearly_base_n=20,
+        min_yearly_removed_n=3,
+    )
+
+    row = out.iloc[0]
+    assert bool(row["ship_eligible"]) is False
+    assert row["eligibility_reason"] == "yearly_min_delta<0"
+    assert row["yearly_penalty"] == 0.04
