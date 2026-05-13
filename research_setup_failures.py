@@ -1014,7 +1014,7 @@ def build_selection_report(slice_eval: pd.DataFrame, min_removed_n: int = 20) ->
     return pd.DataFrame(rows).sort_values("selection_score", ascending=False).reset_index(drop=True)
 
 
-def select_ship_config(selection: pd.DataFrame) -> pd.DataFrame:
+def select_ship_config(selection: pd.DataFrame, preferred_filter: str | None = None) -> pd.DataFrame:
     if selection.empty:
         return pd.DataFrame()
     candidates = selection.copy()
@@ -1022,6 +1022,10 @@ def select_ship_config(selection: pd.DataFrame) -> pd.DataFrame:
         candidates = candidates[candidates["ship_eligible"].astype(bool)]
     if candidates.empty:
         return pd.DataFrame(columns=selection.columns)
+    if preferred_filter:
+        preferred = candidates[candidates["filter"].eq(preferred_filter)]
+        if not preferred.empty:
+            candidates = preferred
     out = candidates.sort_values("selection_score", ascending=False).head(1).copy()
     out["selected_for_ship"] = True
     return out.reset_index(drop=True)
@@ -1298,6 +1302,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pcx-failure-skip-list-output", type=Path, default=PCX_FAILURE_SKIP_LIST_PATH)
     parser.add_argument("--pcx-failure-holdout-output", type=Path, default=PCX_FAILURE_HOLDOUT_PATH)
     parser.add_argument("--pcx-failure-fixed-holdout-output", type=Path, default=PCX_FAILURE_FIXED_HOLDOUT_PATH)
+    parser.add_argument("--preferred-filter", default="")
     parser.add_argument("--holdout-start", default="2022-01-01")
     parser.add_argument("--yearly-output", type=Path, default=YEARLY_PATH)
     parser.add_argument("--comparison-output", type=Path, default=COMPARISON_PATH)
@@ -1361,7 +1366,8 @@ def main() -> None:
         ]
         side_slice_eval = pd.concat(side_frames, ignore_index=True) if side_frames else pd.DataFrame()
         selection = build_robust_selection_report(slice_eval, yearly_by_slice=yearly_by_slice)
-        ship_config = select_ship_config(selection)
+        preferred_filter = args.preferred_filter.strip() or None
+        ship_config = select_ship_config(selection, preferred_filter=preferred_filter)
         skip_list = build_ship_skip_list(scores, ship_config)
         holdout = evaluate_ship_holdout(slice_eval, ship_config)
         fixed_holdout = pd.DataFrame()
@@ -1401,7 +1407,7 @@ def main() -> None:
                     yearly_by_slice=yearly_by_slice,
                     fixed_holdout=fixed_holdout,
                 )
-                ship_config = select_ship_config(selection)
+                ship_config = select_ship_config(selection, preferred_filter=preferred_filter)
                 skip_list = build_ship_skip_list(scores, ship_config)
                 holdout = evaluate_ship_holdout(slice_eval, ship_config)
         args.pcx_failure_summary_output.parent.mkdir(parents=True, exist_ok=True)
