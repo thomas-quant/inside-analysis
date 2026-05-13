@@ -341,6 +341,74 @@ def test_build_selection_report_ranks_transfer_and_penalizes_small_removed():
     assert out.iloc[0]["selection_score"] > out.iloc[1]["selection_score"]
 
 
+def test_select_ship_config_returns_best_selection_row():
+    from research_setup_failures import select_ship_config
+
+    selection = pd.DataFrame({
+        "target": ["failure_any", "inside_failure"],
+        "candidate_model": ["logistic", "hgb"],
+        "filter": ["remove_top_30", "remove_top_20"],
+        "selection_score": [0.10, 0.05],
+    })
+
+    out = select_ship_config(selection)
+
+    assert len(out) == 1
+    assert out.iloc[0]["target"] == "failure_any"
+    assert bool(out.iloc[0]["selected_for_ship"]) is True
+
+
+def test_build_ship_skip_list_filters_selected_scores():
+    from research_setup_failures import build_ship_skip_list
+
+    scores = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+        "direction": ["LONG", "SHORT", "LONG"],
+        "score": [0.1, 0.9, 0.8],
+        "hit": [True, False, True],
+        "setup": ["pcx_wick"] * 3,
+        "target": ["failure_any"] * 3,
+        "candidate_model": ["logistic"] * 3,
+        "remove_top_30": [False, True, True],
+    })
+    ship_config = pd.DataFrame({
+        "target": ["failure_any"],
+        "candidate_model": ["logistic"],
+        "filter": ["remove_top_30"],
+    })
+
+    out = build_ship_skip_list(scores, ship_config)
+
+    assert list(out["trade_date"]) == list(pd.to_datetime(["2024-01-02", "2024-01-03"]))
+    assert set(out["action"]) == {"skip"}
+    assert set(out["ship_filter"]) == {"remove_top_30"}
+
+
+def test_evaluate_ship_holdout_reports_recent_slice_metrics():
+    from research_setup_failures import evaluate_ship_holdout
+
+    slice_eval = pd.DataFrame({
+        "eval_setup": ["pcx_ict", "pcx_ict_cisd", "pcx_ict"],
+        "target": ["failure_any", "failure_any", "inside_failure"],
+        "candidate_model": ["logistic", "logistic", "logistic"],
+        "filter": ["remove_top_30", "remove_top_30", "remove_top_30"],
+        "base_n": [100, 50, 100],
+        "kept_hit_rate": [0.85, 0.86, 0.82],
+        "delta_kept_vs_base": [0.08, 0.09, 0.02],
+        "removed_n": [30, 20, 30],
+    })
+    ship_config = pd.DataFrame({
+        "target": ["failure_any"],
+        "candidate_model": ["logistic"],
+        "filter": ["remove_top_30"],
+    })
+
+    out = evaluate_ship_holdout(slice_eval, ship_config)
+
+    assert set(out["eval_setup"]) == {"pcx_ict", "pcx_ict_cisd"}
+    assert (out["holdout_pass"] == True).all()
+
+
 def test_summarize_setup_filter_reports_kept_removed_trade_value():
     from research_setup_failures import summarize_setup_filter
 
