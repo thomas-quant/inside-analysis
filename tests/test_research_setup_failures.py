@@ -311,3 +311,30 @@ def test_failure_mode_feature_columns_include_plausible_groups_and_exclude_leaky
     assert "inside_failure" not in cols
     assert "failure_any" not in cols
 
+
+def test_build_slice_eval_preserves_target_model_filter_and_train_setup():
+    from research_setup_failures import build_slice_eval
+
+    scores = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+        "hit": [True, False, True],
+        "remove_top_20": [False, True, False],
+        "setup": ["pcx_wick"] * 3,
+        "target": ["failure_any"] * 3,
+        "candidate_model": ["hgb"] * 3,
+    })
+    slice_membership = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+        "pcx_wick": [True, True, True],
+        "pcx_ict": [True, True, False],
+        "pcx_ict_cisd": [False, True, False],
+    })
+
+    out = build_slice_eval(scores, slice_membership, filter_col="remove_top_20")
+    row = out[out["eval_setup"].eq("pcx_ict")].iloc[0]
+
+    assert row["train_setup"] == "pcx_wick"
+    assert row["target"] == "failure_any"
+    assert row["candidate_model"] == "hgb"
+    assert row["filter"] == "remove_top_20"
+    assert row["base_n"] == 2

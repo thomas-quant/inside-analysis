@@ -564,6 +564,8 @@ def _summary_row_for_scores(scores: pd.DataFrame, filter_col: str) -> dict:
     removed = scores[scores[filter_col].astype(bool)]
     kept = scores[~scores[filter_col].astype(bool)]
     return {
+        "target": scores["target"].iloc[0] if "target" in scores and len(scores) else np.nan,
+        "candidate_model": scores["candidate_model"].iloc[0] if "candidate_model" in scores and len(scores) else np.nan,
         "filter": filter_col,
         "base_n": len(scores),
         "base_hit_rate": _rate(scores["hit"]),
@@ -590,6 +592,8 @@ def build_slice_eval(
     for col in [c for c in membership.columns if c != "trade_date"]:
         group = joined[joined[col].astype(bool)]
         row = _summary_row_for_scores(group, filter_col) if len(group) else {
+            "target": scored["target"].iloc[0] if "target" in scored and len(scored) else np.nan,
+            "candidate_model": scored["candidate_model"].iloc[0] if "candidate_model" in scored and len(scored) else np.nan,
             "filter": filter_col,
             "base_n": 0,
             "base_hit_rate": np.nan,
