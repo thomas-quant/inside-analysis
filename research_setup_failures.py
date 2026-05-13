@@ -291,9 +291,51 @@ def _fit_scores(model_name: str, X_train: np.ndarray, y_train: np.ndarray, X_tes
         weights = np.where(y_train, pos_weight, neg_weight)
         clf = HistGradientBoostingClassifier(max_iter=30, learning_rate=0.05, max_leaf_nodes=15, random_state=42)
         clf.fit(X_train, y_train.astype(int), sample_weight=weights)
+    elif model_name.startswith("xgb_gpu"):
+        try:
+            from xgboost import XGBClassifier
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("xgboost not installed; cannot use xgb_gpu models") from exc
+        clf = XGBClassifier(**xgb_gpu_params(scale_pos_weight=n_neg / n_pos, model_name=model_name))
+        try:
+            clf.fit(X_train, y_train.astype(int))
+        except Exception as exc:
+            raise RuntimeError(f"{model_name} failed; CUDA-enabled xgboost may be unavailable: {exc}") from exc
     else:
         raise ValueError(f"Unknown model_name={model_name}")
     return clf.predict_proba(X_train)[:, 1].astype(float), clf.predict_proba(X_test)[:, 1].astype(float)
+
+
+def xgb_gpu_params(scale_pos_weight: float, model_name: str = "xgb_gpu") -> dict:
+    """XGBoost >=3.1 CUDA params: use device, no removed gpu_id/predictor."""
+    variants = {
+        "xgb_gpu": {"max_depth": 3, "n_estimators": 160, "learning_rate": 0.04},
+        "xgb_gpu_depth2": {"max_depth": 2, "n_estimators": 220, "learning_rate": 0.035},
+        "xgb_gpu_depth3": {"max_depth": 3, "n_estimators": 220, "learning_rate": 0.035},
+        "xgb_gpu_depth4": {"max_depth": 4, "n_estimators": 180, "learning_rate": 0.03},
+        "xgb_gpu_tuned": {"max_depth": 3, "n_estimators": 300, "learning_rate": 0.025},
+    }
+    if model_name not in variants:
+        raise ValueError(f"Unknown xgb gpu model_name={model_name}")
+    params = {
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "min_child_weight": 3,
+        "reg_lambda": 5.0,
+        "objective": "binary:logistic",
+        "eval_metric": "logloss",
+        "tree_method": "hist",
+        "device": "cuda",
+        "scale_pos_weight": scale_pos_weight,
+        "random_state": 42,
+        "verbosity": 0,
+    }
+    params.update(variants[model_name])
+    return params
+
+
+def _should_skip_model_error(model_name: str, exc: Exception) -> bool:
+    return model_name.startswith("xgb_gpu") and isinstance(exc, RuntimeError)
 
 
 def _flag_name(fraction: float) -> str:
@@ -707,14 +749,20 @@ def run_setup_failure_research(
     score_frames = []
     for target in targets:
         for model_name in model_names:
-            scores = blocked_setup_failure_scores(
-                frame,
-                feature_cols,
-                target_col=target,
-                model_name=model_name,
-                init_window=init_window,
-                n_splits=n_splits,
-            )
+            try:
+                scores = blocked_setup_failure_scores(
+                    frame,
+                    feature_cols,
+                    target_col=target,
+                    model_name=model_name,
+                    init_window=init_window,
+                    n_splits=n_splits,
+                )
+            except RuntimeError as exc:
+                if _should_skip_model_error(model_name, exc):
+                    print(f"Skipping {model_name}: {exc}")
+                    continue
+                raise
             if scores.empty:
                 continue
             scores["setup"] = setup
@@ -752,14 +800,20 @@ def run_pcx_failure_mode_research(
     slice_frames = []
     for target in targets:
         for model_name in model_names:
-            scores = blocked_setup_failure_scores(
-                frame,
-                feature_cols,
-                target_col=target,
-                model_name=model_name,
-                init_window=init_window,
-                n_splits=n_splits,
-            )
+            try:
+                scores = blocked_setup_failure_scores(
+                    frame,
+                    feature_cols,
+                    target_col=target,
+                    model_name=model_name,
+                    init_window=init_window,
+                    n_splits=n_splits,
+                )
+            except RuntimeError as exc:
+                if _should_skip_model_error(model_name, exc):
+                    print(f"Skipping {model_name}: {exc}")
+                    continue
+                raise
             if scores.empty:
                 continue
             scores["setup"] = train_setup
