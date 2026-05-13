@@ -64,6 +64,32 @@ PCX_FEATURE_COLUMNS = [
     "signal_range_vs_prior_range",
 ]
 
+REGIME_FEATURE_COLUMNS = [
+    "trend_score",
+    "containment_score",
+    "chop_score",
+    "mss",
+    "adx_quality",
+    "adx_strength",
+    "adx_persistence",
+    "adx_crossover",
+    "irr",
+    "er",
+    "er_net_change",
+    "log_vr",
+    "vr_raw",
+    "dra",
+    "containment_overshoot_ratio",
+    "containment_range_stability",
+    "containment_mid_cross_count",
+    "containment_swing_symmetry",
+    "containment_ib_extension_ratio",
+    "containment_ib_asymmetry",
+    "containment_bandwidth_squeeze",
+    "containment_vwap_acceptance",
+    "containment_excess_rejection",
+]
+
 FAILURE_MODE_FEATURE_CANDIDATES = [
     # PCX candle quality
     "signal_body_to_range",
@@ -110,6 +136,7 @@ FAILURE_MODE_FEATURE_CANDIDATES = [
     "side",
     "ict_match",
     "cisd_match",
+    *[f"regime_{col}" for col in REGIME_FEATURE_COLUMNS],
 ]
 
 LEAKY_FAILURE_MODE_COLUMNS = {
@@ -132,6 +159,26 @@ def failure_mode_feature_columns(frame: pd.DataFrame) -> list[str]:
             if pd.api.types.is_numeric_dtype(frame[col]) or pd.api.types.is_bool_dtype(frame[col]):
                 cols.append(col)
     return cols
+
+
+def prepare_regime_features(
+    regime_features: pd.DataFrame,
+    session_name: str | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
+    regime = regime_features.copy()
+    if session_name and "session_name" in regime.columns:
+        regime = regime[regime["session_name"].eq(session_name)].copy()
+    date_col = "signal_date" if "signal_date" in regime.columns else "trade_date"
+    regime["signal_date"] = _normalize_dates(regime[date_col]).to_numpy()
+    cols = [
+        col for col in REGIME_FEATURE_COLUMNS
+        if col in regime.columns and pd.api.types.is_numeric_dtype(regime[col])
+    ]
+    out = regime[["signal_date"] + cols].copy()
+    rename = {col: f"regime_{col}" for col in cols}
+    out = out.rename(columns=rename)
+    out = out.groupby("signal_date", as_index=False).last()
+    return out, list(rename.values())
 
 EXCLUDED_SIGNAL_COLUMNS = {
     "date", "trade_date", "signal_date", "prior_date", "direction", "hit", "wick_filtered",
@@ -238,6 +285,8 @@ def build_setup_frame(
     signal_features: pd.DataFrame,
     setup: str = "pcx_ict",
     markovian_root: str | Path | None = DEFAULT_MARKOVIAN_ROOT,
+    regime_features: pd.DataFrame | None = None,
+    regime_session: str | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Build setup rows with labels and leak-safe signal-date features."""
     daily = add_inside_research_features(daily_features)
@@ -266,6 +315,10 @@ def build_setup_frame(
     daily_feature_cols = _feature_columns(daily, "full_available")
     signal_daily = daily[["trade_date"] + daily_feature_cols].rename(columns={"trade_date": "signal_date"})
     frame = frame.merge(signal_daily, on="signal_date", how="left")
+    regime_cols = []
+    if regime_features is not None:
+        regime_frame, regime_cols = prepare_regime_features(regime_features, session_name=regime_session)
+        frame = frame.merge(regime_frame, on="signal_date", how="left")
 
     frame["hit"] = frame["hit"].astype(bool)
     frame["target_inside"] = frame["target_inside"].fillna(False).astype(bool)
@@ -273,7 +326,7 @@ def build_setup_frame(
     frame["inside_failure"] = frame["failure_any"] & frame["target_inside"]
 
     pcx_cols = [c for c in PCX_FEATURE_COLUMNS if c in frame.columns]
-    feature_cols = daily_feature_cols + pcx_cols + ["side"]
+    feature_cols = daily_feature_cols + pcx_cols + regime_cols + ["side"]
     feature_cols = [c for c in feature_cols if c in frame.columns and c != "inside_next"]
     return frame.sort_values("trade_date").reset_index(drop=True), feature_cols
 
@@ -921,6 +974,8 @@ def run_pcx_failure_mode_research(
     init_window: int = 200,
     n_splits: int = 3,
     threshold_fractions: list[float] | None = None,
+    regime_feature_path: Path | None = None,
+    regime_session: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     eval_setups = eval_setups or ["pcx_wick", "pcx_ict", "pcx_ict_cisd"]
     targets = targets or ["failure_any", "inside_failure"]
@@ -928,8 +983,21 @@ def run_pcx_failure_mode_research(
 
     daily = pd.read_parquet(feature_path)
     signals = pd.read_csv(signal_path, parse_dates=["date", "signal_date"])
-    frame, _ = build_setup_frame(daily, signals, setup=train_setup, markovian_root=markovian_root)
-    feature_cols = _usable_feature_columns(frame, failure_mode_feature_columns(frame))
+    regime = pd.read_parquet(regime_feature_path) if regime_feature_path else None
+    frame, _ = build_setup_frame(
+        daily,
+        signals,
+        setup=train_setup,
+        markovian_root=markovian_root,
+        regime_features=regime,
+        regime_session=regime_session,
+    )
+    min_non_na = 0.70 if regime is not None else 0.80
+    feature_cols = _usable_feature_columns(
+        frame,
+        failure_mode_feature_columns(frame),
+        min_non_na_fraction=min_non_na,
+    )
     membership = build_slice_membership(daily, signals, setups=eval_setups, markovian_root=markovian_root)
 
     summaries = []
@@ -993,6 +1061,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pcx-failure-yearly-by-slice-output", type=Path, default=PCX_FAILURE_YEARLY_BY_SLICE_PATH)
     parser.add_argument("--pcx-failure-side-slice-output", type=Path, default=PCX_FAILURE_SIDE_SLICE_PATH)
     parser.add_argument("--pcx-failure-selection-output", type=Path, default=PCX_FAILURE_SELECTION_PATH)
+    parser.add_argument("--regime-feature-path", type=Path, default=None)
+    parser.add_argument("--regime-session", default=None)
     parser.add_argument("--yearly-output", type=Path, default=YEARLY_PATH)
     parser.add_argument("--comparison-output", type=Path, default=COMPARISON_PATH)
     parser.add_argument("--permutation-output", type=Path, default=PERMUTATION_PATH)
@@ -1032,6 +1102,8 @@ def main() -> None:
             init_window=args.init_window,
             n_splits=args.splits,
             threshold_fractions=threshold_fractions,
+            regime_feature_path=args.regime_feature_path,
+            regime_session=args.regime_session,
         )
         daily = pd.read_parquet(args.feature_path)
         signals = pd.read_csv(args.signal_path, parse_dates=["date", "signal_date"])
