@@ -505,110 +505,6 @@ def test_failure_mode_feature_columns_include_plausible_groups_and_exclude_leaky
     assert "failure_any" not in cols
 
 
-def test_prepare_regime_features_filters_session_and_prefixes_columns():
-    from research_setup_failures import prepare_regime_features
-
-    regime = pd.DataFrame({
-        "trade_date": pd.to_datetime(["2024-01-01", "2024-01-01", "2024-01-02"]),
-        "session_name": ["1pm-3pm", "3pm-3:50pm", "1pm-3pm"],
-        "trend_score": [0.8, 0.1, 0.2],
-        "containment_score": [0.1, 0.7, 0.6],
-        "chop_score": [0.2, 0.8, 0.5],
-        "adx_quality": [0.9, 0.2, 0.3],
-    })
-
-    out, cols = prepare_regime_features(regime, session_name="1pm-3pm")
-
-    assert len(out) == 2
-    assert "signal_date" in out.columns
-    assert "regime_trend_score" in cols
-    assert "regime_containment_score" in cols
-    assert "regime_adx_quality" in cols
-    assert out.loc[out["signal_date"].eq(pd.Timestamp("2024-01-01")), "regime_trend_score"].iloc[0] == 0.8
-
-
-def test_build_setup_frame_merges_regime_features_on_signal_date():
-    from research_setup_failures import build_setup_frame
-
-    daily = _daily_features(10)
-    signals = _signals(1)
-    target_date = pd.Timestamp(signals.loc[0, "date"])
-    signal_date = pd.Timestamp(signals.loc[0, "signal_date"])
-    regime = pd.DataFrame({
-        "trade_date": [signal_date, target_date],
-        "session_name": ["1pm-3pm", "1pm-3pm"],
-        "trend_score": [0.25, 0.99],
-        "containment_score": [0.75, 0.01],
-        "chop_score": [0.50, 0.02],
-    })
-
-    frame, feature_cols = build_setup_frame(
-        daily,
-        signals,
-        setup="pcx_ict",
-        regime_features=regime,
-        regime_session="1pm-3pm",
-    )
-    row = frame[frame["trade_date"].eq(target_date)].iloc[0]
-
-    assert row["regime_trend_score"] == 0.25
-    assert row["regime_containment_score"] == 0.75
-    assert "regime_trend_score" in feature_cols
-
-
-def test_run_pcx_failure_mode_research_keeps_regime_features_with_partial_coverage(monkeypatch, tmp_path):
-    import research_setup_failures
-    from research_setup_failures import run_pcx_failure_mode_research
-
-    daily = _daily_features(80)
-    signals = _signals(70)
-    regime = pd.DataFrame({
-        "trade_date": pd.date_range("2024-01-01", periods=55),
-        "session_name": ["1pm-3pm"] * 55,
-        "trend_score": np.linspace(0.1, 0.9, 55),
-        "containment_score": np.linspace(0.9, 0.1, 55),
-        "chop_score": np.linspace(0.2, 0.8, 55),
-    })
-    feature_path = tmp_path / "features.parquet"
-    signal_path = tmp_path / "signals.csv"
-    regime_path = tmp_path / "regime.parquet"
-    daily.to_parquet(feature_path, index=False)
-    signals.to_csv(signal_path, index=False)
-    regime.to_parquet(regime_path, index=False)
-    captured = {}
-
-    def fake_blocked(frame, feature_cols, **kwargs):
-        captured["regime_cols"] = [c for c in feature_cols if c.startswith("regime_")]
-        return pd.DataFrame({
-            "trade_date": frame["trade_date"].iloc[30:35].to_numpy(),
-            "direction": frame["direction"].iloc[30:35].to_numpy(),
-            "hit": frame["hit"].iloc[30:35].to_numpy(),
-            "target": [kwargs["target_col"]] * 5,
-            "true_failure": [False] * 5,
-            "score": np.linspace(0.1, 0.5, 5),
-            "block_id": [0] * 5,
-            "remove_top_20": [False, False, True, False, True],
-        })
-
-    monkeypatch.setattr(research_setup_failures, "blocked_setup_failure_scores", fake_blocked)
-
-    run_pcx_failure_mode_research(
-        feature_path=feature_path,
-        signal_path=signal_path,
-        markovian_root=None,
-        train_setup="pcx_wick",
-        eval_setups=["pcx_wick"],
-        targets=["failure_any"],
-        model_names=["logistic"],
-        init_window=30,
-        n_splits=2,
-        regime_feature_path=regime_path,
-        regime_session="1pm-3pm",
-    )
-
-    assert "regime_trend_score" in captured["regime_cols"]
-
-
 def test_build_slice_eval_preserves_target_model_filter_and_train_setup():
     from research_setup_failures import build_slice_eval
 
@@ -703,7 +599,6 @@ def test_research_setup_failures_uses_safe_inputs_only():
         "summary_path",
         "feature_path",
         "signal_path",
-        "regime_feature_path",
         "args.feature_path",
         "args.signal_path",
     }
