@@ -758,3 +758,130 @@ def test_build_setup_frame_computes_missing_cisd_direction_from_signal_date(monk
     frame, _ = build_setup_frame(daily, signals, setup="pcx_ict_cisd")
 
     assert target_date in set(frame["trade_date"])
+
+def test_add_pcx_failure_engineered_features_are_side_adjusted_and_numeric():
+    from research_setup_failures import add_pcx_failure_engineered_features, failure_mode_feature_columns
+
+    frame = pd.DataFrame({
+        "direction": ["LONG", "SHORT"],
+        "side": [1.0, -1.0],
+        "signal_body_to_range": [0.4, 0.4],
+        "prior_body_to_range": [0.2, 0.2],
+        "signal_close_location": [0.8, 0.2],
+        "prior_close_location": [0.7, 0.3],
+        "signal_close_to_target_extreme": [0.1, 0.1],
+        "prior_close_to_target_extreme": [0.2, 0.2],
+        "signal_close_through": [0.3, -0.3],
+        "prior_close_through": [0.1, -0.1],
+        "signal_range_vs_prior_range": [1.5, 1.5],
+        "range_percentile_22": [0.2, 0.2],
+        "rv_regime_252": [0.5, 0.5],
+        "hit": [True, False],
+        "failure_any": [False, True],
+    })
+
+    out = add_pcx_failure_engineered_features(frame)
+
+    assert list(out["signal_close_location_side_adj"].round(6)) == [0.8, 0.8]
+    assert list(out["prior_close_location_side_adj"].round(6)) == [0.7, 0.7]
+    assert list(out["signal_close_through_side_adj"].round(6)) == [0.3, 0.3]
+    assert (out["pcx_quality"] > 0).all()
+    assert "pcx_quality_x_compression" in failure_mode_feature_columns(out)
+    assert "signal_close_location_side_adj" in failure_mode_feature_columns(out)
+
+def test_build_robust_selection_report_requires_positive_ict_and_cisd():
+    from research_setup_failures import build_robust_selection_report
+
+    slice_eval = pd.DataFrame({
+        "target": ["failure_any", "failure_any"],
+        "candidate_model": ["logistic", "logistic"],
+        "filter": ["remove_top_20", "remove_top_20"],
+        "eval_setup": ["pcx_ict", "pcx_ict_cisd"],
+        "delta_kept_vs_base": [0.04, -0.01],
+        "removed_n": [40, 30],
+    })
+    yearly = pd.DataFrame({
+        "target": ["failure_any", "failure_any"],
+        "candidate_model": ["logistic", "logistic"],
+        "filter": ["remove_top_20", "remove_top_20"],
+        "eval_setup": ["pcx_ict", "pcx_ict_cisd"],
+        "delta_kept_vs_base": [0.02, 0.03],
+    })
+
+    out = build_robust_selection_report(slice_eval, yearly_by_slice=yearly, min_removed_n=20)
+
+    assert bool(out.iloc[0]["ship_eligible"]) is False
+    assert out.iloc[0]["eligibility_reason"] == "pcx_ict_cisd_delta<=0"
+
+
+def test_build_robust_selection_report_penalizes_negative_yearly_stability():
+    from research_setup_failures import build_robust_selection_report
+
+    slice_eval = pd.DataFrame({
+        "target": ["failure_any", "failure_any", "failure_any", "failure_any"],
+        "candidate_model": ["stable", "stable", "unstable", "unstable"],
+        "filter": ["remove_top_20"] * 4,
+        "eval_setup": ["pcx_ict", "pcx_ict_cisd", "pcx_ict", "pcx_ict_cisd"],
+        "delta_kept_vs_base": [0.04, 0.04, 0.05, 0.05],
+        "removed_n": [40, 30, 40, 30],
+    })
+    yearly = pd.DataFrame({
+        "target": ["failure_any", "failure_any", "failure_any", "failure_any"],
+        "candidate_model": ["stable", "stable", "unstable", "unstable"],
+        "filter": ["remove_top_20"] * 4,
+        "eval_setup": ["pcx_ict", "pcx_ict_cisd", "pcx_ict", "pcx_ict_cisd"],
+        "delta_kept_vs_base": [0.01, 0.02, -0.06, -0.04],
+    })
+
+    out = build_robust_selection_report(slice_eval, yearly_by_slice=yearly, min_removed_n=20)
+
+    assert out.iloc[0]["candidate_model"] == "stable"
+    unstable = out[out["candidate_model"].eq("unstable")].iloc[0]
+    assert unstable["yearly_penalty"] > 0
+    assert bool(unstable["ship_eligible"]) is False
+
+def test_select_ship_config_returns_empty_when_no_eligible_candidate():
+    from research_setup_failures import select_ship_config
+
+    selection = pd.DataFrame({
+        "target": ["failure_any"],
+        "candidate_model": ["logistic"],
+        "filter": ["remove_top_20"],
+        "selection_score": [0.20],
+        "ship_eligible": [False],
+        "eligibility_reason": ["pcx_ict_delta<=0"],
+    })
+
+    out = select_ship_config(selection)
+
+    assert out.empty
+
+def test_pcx_failure_mode_selection_contains_robust_columns(tmp_path):
+    from research_setup_failures import run_pcx_failure_mode_research, build_slice_membership, build_yearly_by_slice, build_robust_selection_report
+
+    daily = _daily_features(140)
+    signals = _signals(130)
+    feature_path = tmp_path / "features.parquet"
+    signal_path = tmp_path / "signals.csv"
+    daily.to_parquet(feature_path, index=False)
+    signals.to_csv(signal_path, index=False)
+
+    summary, scores, slice_eval = run_pcx_failure_mode_research(
+        feature_path=feature_path,
+        signal_path=signal_path,
+        markovian_root=None,
+        train_setup="pcx_wick",
+        eval_setups=["pcx_wick", "pcx_ict", "pcx_ict_cisd"],
+        targets=["failure_any"],
+        model_names=["logistic", "ensemble_rank_mean"],
+        init_window=40,
+        n_splits=3,
+        threshold_fractions=[0.20, 0.30],
+    )
+    membership = build_slice_membership(daily, signals, setups=["pcx_wick", "pcx_ict", "pcx_ict_cisd"], markovian_root=None)
+    yearly = build_yearly_by_slice(scores, membership, filter_col="remove_top_20")
+    selection = build_robust_selection_report(slice_eval, yearly_by_slice=yearly, min_removed_n=1)
+
+    assert not selection.empty
+    assert {"ship_eligible", "eligibility_reason", "yearly_penalty", "pcx_ict_delta", "pcx_ict_cisd_delta"}.issubset(selection.columns)
+    assert {"logistic", "ensemble_rank_mean"}.issubset(set(selection["candidate_model"]))
