@@ -80,6 +80,16 @@ FAILURE_MODE_FEATURE_CANDIDATES = [
     "signal_close_through",
     "prior_close_through",
     "signal_range_vs_prior_range",
+    "signal_close_location_side_adj",
+    "prior_close_location_side_adj",
+    "signal_close_through_side_adj",
+    "prior_close_through_side_adj",
+    "target_wick_pressure",
+    "adverse_wick_pressure",
+    "pcx_quality",
+    "pcx_quality_x_compression",
+    "pcx_quality_x_rv_regime",
+    "pcx_quality_x_range_expansion",
     # inside/compression regime
     "inside_lag1",
     "outside_lag1",
@@ -137,6 +147,46 @@ def failure_mode_feature_columns(frame: pd.DataFrame) -> list[str]:
             if pd.api.types.is_numeric_dtype(frame[col]) or pd.api.types.is_bool_dtype(frame[col]):
                 cols.append(col)
     return cols
+
+
+def add_pcx_failure_engineered_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Add leak-safe PCX shape features derived from signal/prior rows only."""
+    out = frame.copy()
+    side = out.get("side", pd.Series(np.nan, index=out.index)).astype(float)
+
+    if "signal_close_location" in out:
+        loc = out["signal_close_location"].astype(float)
+        out["signal_close_location_side_adj"] = np.where(side >= 0, loc, 1.0 - loc)
+        out["target_wick_pressure"] = np.where(side >= 0, 1.0 - loc, loc)
+        out["adverse_wick_pressure"] = np.where(side >= 0, loc, 1.0 - loc)
+    if "prior_close_location" in out:
+        loc = out["prior_close_location"].astype(float)
+        out["prior_close_location_side_adj"] = np.where(side >= 0, loc, 1.0 - loc)
+    if "signal_close_through" in out:
+        out["signal_close_through_side_adj"] = out["signal_close_through"].astype(float) * side
+    if "prior_close_through" in out:
+        out["prior_close_through_side_adj"] = out["prior_close_through"].astype(float) * side
+
+    quality_parts = []
+    for col in [
+        "signal_body_to_range",
+        "prior_body_to_range",
+        "signal_close_location_side_adj",
+        "prior_close_location_side_adj",
+        "signal_close_through_side_adj",
+    ]:
+        if col in out:
+            quality_parts.append(out[col].astype(float))
+    if quality_parts:
+        out["pcx_quality"] = pd.concat(quality_parts, axis=1).mean(axis=1)
+    if "pcx_quality" in out:
+        compression = 1.0 - out.get("range_percentile_22", pd.Series(0.5, index=out.index)).astype(float)
+        rv_regime = out.get("rv_regime_252", pd.Series(0.5, index=out.index)).astype(float)
+        range_expansion = out.get("signal_range_vs_prior_range", pd.Series(1.0, index=out.index)).astype(float)
+        out["pcx_quality_x_compression"] = out["pcx_quality"] * compression
+        out["pcx_quality_x_rv_regime"] = out["pcx_quality"] * rv_regime
+        out["pcx_quality_x_range_expansion"] = out["pcx_quality"] * range_expansion
+    return out
 
 EXCLUDED_SIGNAL_COLUMNS = {
     "date", "trade_date", "signal_date", "prior_date", "direction", "hit", "wick_filtered",
@@ -276,6 +326,7 @@ def build_setup_frame(
     frame["target_inside"] = frame["target_inside"].fillna(False).astype(bool)
     frame["failure_any"] = ~frame["hit"]
     frame["inside_failure"] = frame["failure_any"] & frame["target_inside"]
+    frame = add_pcx_failure_engineered_features(frame)
 
     pcx_cols = [c for c in PCX_FEATURE_COLUMNS if c in frame.columns]
     feature_cols = daily_feature_cols + pcx_cols + ["side"]
@@ -403,6 +454,10 @@ def _should_skip_model_error(model_name: str, exc: Exception) -> bool:
 
 def _flag_name(fraction: float) -> str:
     return f"remove_top_{int(round(fraction * 100)):02d}"
+
+
+def _fraction_from_flag(flag: str) -> float:
+    return int(flag.rsplit("_", 1)[1]) / 100.0
 
 
 def parse_thresholds(value: str | None) -> list[float] | None:
@@ -808,6 +863,112 @@ def build_side_slice_eval(
     return pd.DataFrame(rows)
 
 
+def _slice_metric(group: pd.DataFrame, setup: str, column: str, default: float = np.nan) -> float:
+    rows = group[group["eval_setup"].eq(setup)] if "eval_setup" in group else group.iloc[0:0]
+    if rows.empty or column not in rows:
+        return default
+    value = rows[column].mean()
+    return float(value) if pd.notna(value) else default
+
+
+def _slice_sum(group: pd.DataFrame, setup: str, column: str) -> int:
+    rows = group[group["eval_setup"].eq(setup)] if "eval_setup" in group else group.iloc[0:0]
+    if rows.empty or column not in rows:
+        return 0
+    return int(rows[column].fillna(0).sum())
+
+
+def _group_lookup_frame(frame: pd.DataFrame | None, keys: tuple, value_col: str) -> pd.DataFrame:
+    if frame is None or frame.empty or value_col not in frame:
+        return pd.DataFrame()
+    target, model, filter_col = keys
+    out = frame[
+        frame["target"].eq(target)
+        & frame["candidate_model"].eq(model)
+        & frame["filter"].eq(filter_col)
+    ].copy()
+    return out
+
+
+def _first_eligibility_failure(row: dict, min_removed_n: int) -> str:
+    checks = [
+        ("pcx_ict_delta<=0", row["pcx_ict_delta"] <= 0 or pd.isna(row["pcx_ict_delta"])),
+        ("pcx_ict_cisd_delta<=0", row["pcx_ict_cisd_delta"] <= 0 or pd.isna(row["pcx_ict_cisd_delta"])),
+        ("pcx_ict_removed_n<min", row["pcx_ict_removed_n"] < min_removed_n),
+        ("yearly_min_delta<0", row["yearly_min_delta"] < 0),
+        ("fixed_holdout_fail", row["fixed_holdout_pass"] is False),
+    ]
+    for reason, failed in checks:
+        if failed:
+            return reason
+    return "eligible"
+
+
+def build_robust_selection_report(
+    slice_eval: pd.DataFrame,
+    yearly_by_slice: pd.DataFrame | None = None,
+    fixed_holdout: pd.DataFrame | None = None,
+    permutation: pd.DataFrame | None = None,
+    min_removed_n: int = 20,
+) -> pd.DataFrame:
+    """Rank PCX failure filters by cross-slice lift with stability penalties."""
+    if slice_eval.empty:
+        return pd.DataFrame()
+    rows = []
+    group_cols = ["target", "candidate_model", "filter"]
+    for keys, group in slice_eval.groupby(group_cols, dropna=False):
+        target, model, filter_col = keys
+        row = {
+            "target": target,
+            "candidate_model": model,
+            "filter": filter_col,
+            "pcx_ict_delta": _slice_metric(group, "pcx_ict", "delta_kept_vs_base"),
+            "pcx_ict_removed_n": _slice_sum(group, "pcx_ict", "removed_n"),
+            "pcx_ict_cisd_delta": _slice_metric(group, "pcx_ict_cisd", "delta_kept_vs_base"),
+            "pcx_ict_cisd_removed_n": _slice_sum(group, "pcx_ict_cisd", "removed_n"),
+            "pcx_wick_delta": _slice_metric(group, "pcx_wick", "delta_kept_vs_base"),
+            "pcx_wick_removed_n": _slice_sum(group, "pcx_wick", "removed_n"),
+        }
+
+        yearly = _group_lookup_frame(yearly_by_slice, keys, "delta_kept_vs_base")
+        deploy_yearly = yearly[yearly["eval_setup"].isin(["pcx_ict", "pcx_ict_cisd"])] if not yearly.empty and "eval_setup" in yearly else yearly
+        row["yearly_min_delta"] = float(deploy_yearly["delta_kept_vs_base"].min()) if len(deploy_yearly) else np.nan
+        row["yearly_penalty"] = abs(min(0.0, row["yearly_min_delta"])) if pd.notna(row["yearly_min_delta"]) else 0.0
+
+        holdout = _group_lookup_frame(fixed_holdout, keys, "delta_kept_vs_base")
+        deploy_holdout = holdout[holdout["eval_setup"].isin(["pcx_ict", "pcx_ict_cisd"])] if not holdout.empty and "eval_setup" in holdout else holdout
+        row["fixed_holdout_delta"] = float(deploy_holdout["delta_kept_vs_base"].mean()) if len(deploy_holdout) else np.nan
+        if "holdout_pass" in deploy_holdout and len(deploy_holdout):
+            row["fixed_holdout_pass"] = bool(deploy_holdout["holdout_pass"].all())
+        elif len(deploy_holdout):
+            row["fixed_holdout_pass"] = bool((deploy_holdout["delta_kept_vs_base"] > 0).all())
+        else:
+            row["fixed_holdout_pass"] = np.nan
+        row["fixed_holdout_penalty"] = 0.05 if row["fixed_holdout_pass"] is False else 0.0
+
+        perm = _group_lookup_frame(permutation, keys, "p_perm")
+        row["p_perm"] = float(perm["p_perm"].iloc[0]) if len(perm) else np.nan
+        row["permutation_penalty"] = max(0.0, row["p_perm"] - 0.20) if pd.notna(row["p_perm"]) else 0.0
+
+        low_removed_penalty = 0.03 * int(row["pcx_ict_removed_n"] < min_removed_n)
+        low_removed_penalty += 0.03 * int(row["pcx_ict_cisd_removed_n"] < max(1, min_removed_n // 2))
+        row["low_removed_penalty"] = low_removed_penalty
+        row["mean_deploy_delta"] = float(np.nanmean([row["pcx_ict_delta"], row["pcx_ict_cisd_delta"]]))
+        row["selection_score"] = (
+            row["mean_deploy_delta"]
+            - row["low_removed_penalty"]
+            - row["yearly_penalty"]
+            - row["fixed_holdout_penalty"]
+            - row["permutation_penalty"]
+        )
+        row["eligibility_reason"] = _first_eligibility_failure(row, min_removed_n)
+        row["ship_eligible"] = row["eligibility_reason"] == "eligible"
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(
+        ["ship_eligible", "selection_score"], ascending=[False, False]
+    ).reset_index(drop=True)
+
+
 def build_selection_report(slice_eval: pd.DataFrame, min_removed_n: int = 20) -> pd.DataFrame:
     if slice_eval.empty:
         return pd.DataFrame()
@@ -838,7 +999,12 @@ def build_selection_report(slice_eval: pd.DataFrame, min_removed_n: int = 20) ->
 def select_ship_config(selection: pd.DataFrame) -> pd.DataFrame:
     if selection.empty:
         return pd.DataFrame()
-    out = selection.sort_values("selection_score", ascending=False).head(1).copy()
+    candidates = selection.copy()
+    if "ship_eligible" in candidates:
+        candidates = candidates[candidates["ship_eligible"].astype(bool)]
+    if candidates.empty:
+        return pd.DataFrame(columns=selection.columns)
+    out = candidates.sort_values("selection_score", ascending=False).head(1).copy()
     out["selected_for_ship"] = True
     return out.reset_index(drop=True)
 
@@ -1091,7 +1257,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--markovian-root", type=Path, default=DEFAULT_MARKOVIAN_ROOT)
     parser.add_argument("--setup", default="pcx_ict", choices=["pcx_wick", "pcx_ict", "pcx_ict_cisd"])
     parser.add_argument("--targets", default="inside_failure,failure_any")
-    parser.add_argument("--models", default="logistic,hgb")
+    parser.add_argument("--models", default=None)
     parser.add_argument("--thresholds", default="")
     parser.add_argument("--init-window", type=int, default=200)
     parser.add_argument("--splits", type=int, default=3)
@@ -1143,6 +1309,11 @@ def main() -> None:
     if args.pcx_failure_mode:
         eval_setups = [x.strip() for x in args.eval_setups.split(",") if x.strip()]
         threshold_fractions = parse_thresholds(args.thresholds) or [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
+        model_names = (
+            [x.strip() for x in args.models.split(",") if x.strip()]
+            if args.models
+            else ["logistic", "hgb", "ensemble_rank_mean"]
+        )
         summary, scores, slice_eval = run_pcx_failure_mode_research(
             feature_path=args.feature_path,
             signal_path=args.signal_path,
@@ -1150,7 +1321,7 @@ def main() -> None:
             train_setup=args.train_setup or "pcx_wick",
             eval_setups=eval_setups or ["pcx_wick", "pcx_ict", "pcx_ict_cisd"],
             targets=[x.strip() for x in args.targets.split(",") if x.strip()],
-            model_names=[x.strip() for x in args.models.split(",") if x.strip()],
+            model_names=model_names,
             init_window=args.init_window,
             n_splits=args.splits,
             threshold_fractions=threshold_fractions,
@@ -1163,13 +1334,15 @@ def main() -> None:
             setups=eval_setups or ["pcx_wick", "pcx_ict", "pcx_ict_cisd"],
             markovian_root=args.markovian_root,
         )
-        yearly_by_slice = build_yearly_by_slice(scores, membership, filter_col=FROZEN_FILTER)
+        flag_cols = [c for c in scores.columns if c.startswith("remove_top_")]
+        yearly_frames = [build_yearly_by_slice(scores, membership, filter_col=flag) for flag in flag_cols]
+        yearly_by_slice = pd.concat(yearly_frames, ignore_index=True) if yearly_frames else pd.DataFrame()
         side_frames = [
             build_side_slice_eval(scores, membership, filter_col=flag)
-            for flag in [c for c in scores.columns if c.startswith("remove_top_")]
+            for flag in flag_cols
         ]
         side_slice_eval = pd.concat(side_frames, ignore_index=True) if side_frames else pd.DataFrame()
-        selection = build_selection_report(slice_eval)
+        selection = build_robust_selection_report(slice_eval, yearly_by_slice=yearly_by_slice)
         ship_config = select_ship_config(selection)
         skip_list = build_ship_skip_list(scores, ship_config)
         holdout = evaluate_ship_holdout(slice_eval, ship_config)
@@ -1191,7 +1364,7 @@ def main() -> None:
                 target_col=str(cfg["target"]),
                 model_name=str(cfg["candidate_model"]),
                 holdout_start=args.holdout_start,
-                threshold_fractions=parse_thresholds(args.thresholds) or [0.30],
+                threshold_fractions=[_fraction_from_flag(str(cfg["filter"]))],
             )
             if not fixed_scores.empty:
                 fixed_scores["setup"] = args.train_setup or "pcx_wick"
@@ -1201,6 +1374,18 @@ def main() -> None:
                     for flag in [c for c in fixed_scores.columns if c.startswith("remove_top_")]
                 ]
                 fixed_holdout = pd.concat(fixed_slice_frames, ignore_index=True) if fixed_slice_frames else pd.DataFrame()
+                fixed_holdout["holdout_pass"] = (
+                    (fixed_holdout["removed_n"] >= 1)
+                    & (fixed_holdout["delta_kept_vs_base"] > 0)
+                )
+                selection = build_robust_selection_report(
+                    slice_eval,
+                    yearly_by_slice=yearly_by_slice,
+                    fixed_holdout=fixed_holdout,
+                )
+                ship_config = select_ship_config(selection)
+                skip_list = build_ship_skip_list(scores, ship_config)
+                holdout = evaluate_ship_holdout(slice_eval, ship_config)
         args.pcx_failure_summary_output.parent.mkdir(parents=True, exist_ok=True)
         args.pcx_failure_scores_output.parent.mkdir(parents=True, exist_ok=True)
         args.pcx_failure_slice_output.parent.mkdir(parents=True, exist_ok=True)
@@ -1234,13 +1419,14 @@ def main() -> None:
         print(f"Wrote PCX failure fixed holdout -> {args.pcx_failure_fixed_holdout_output}")
         return
     setup = args.train_setup or args.setup
+    model_names = [x.strip() for x in args.models.split(",") if x.strip()] if args.models else ["logistic", "hgb"]
     summary, scores = run_setup_failure_research(
         feature_path=args.feature_path,
         signal_path=args.signal_path,
         markovian_root=args.markovian_root,
         setup=setup,
         targets=[x.strip() for x in args.targets.split(",") if x.strip()],
-        model_names=[x.strip() for x in args.models.split(",") if x.strip()],
+        model_names=model_names,
         init_window=args.init_window,
         n_splits=args.splits,
         threshold_fractions=parse_thresholds(args.thresholds),
